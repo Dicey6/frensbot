@@ -1,32 +1,22 @@
 """
-main.py — FundedFrens Telegram Trading Bot entry point.
+main.py — FundedFrens Telegram Trading Bot.
 
-Bot features (trading terminal only):
-  /start → Home screen (or link prompt if not linked)
-  /link  → Link Telegram to a FundedFrens account
-  /home  → Home screen with account summary
-  /buy   → Search and buy a Solana token
-  /sell  → Sell an open position
-  /positions → View open positions with live PnL
-  /portfolio → Recent trade history
-  /settings  → View / edit default risk parameters
-  /pnl  → Generate and send a PnL summary card
+UX principles:
+  - Everything runs through inline keyboards — no /command typing required mid-flow
+  - Every bot message is edited in place (single active message per user)
+  - User text input is deleted immediately to keep the chat clean
+  - Every screen has a ← Back button
+  - Plain text (including TG- link codes) is caught globally — /commands are optional shortcuts
+  - Background monitor uses PTB's job_queue (not asyncio.create_task) for clean lifecycle
 
-Field mapping vs. original bot (ALL corrected here):
-  profile["auth_user_id"] → profile["id"]
-  telegram_link_token     → telegram_link_code
-  telegram_status TEXT    → telegram_linked BOOLEAN
-  user_challenges table   → challenges table
-  challenge_plans table   → PLAN_USD dict in config.py
+Commands (optional shortcuts, all work via buttons too):
+  /start /home /buy /sell /positions /portfolio /settings /pnl /link
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 import sys
-from typing import Any
 
 from telegram import (
     InlineKeyboardButton,
@@ -46,6 +36,7 @@ from telegram.ext import (
 import config
 import database as db
 import trading
+from config import TRADING
 from pnl import generate_pnl_card
 
 # ---------------------------------------------------------------------------
@@ -65,249 +56,306 @@ log = logging.getLogger(__name__)
 
 (
     BUY_TOKEN_INPUT,
+    BUY_PICK_TOKEN,
     BUY_AMOUNT_INPUT,
     BUY_CONFIRM,
     SELL_SELECT,
     SELL_PCT_INPUT,
     SELL_CONFIRM,
-    SETTINGS_FIELD,
+    SETTINGS_PICK,
     SETTINGS_VALUE,
-    LINK_CODE_INPUT,
 ) = range(9)
 
 # ---------------------------------------------------------------------------
-# Shared menus
+# Keyboards
 # ---------------------------------------------------------------------------
 
-MAIN_MENU_KEYBOARD = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("💰 Buy",       callback_data="menu_buy"),
-        InlineKeyboardButton("📤 Sell",      callback_data="menu_sell"),
-    ],
-    [
-        InlineKeyboardButton("📊 Positions", callback_data="menu_positions"),
-        InlineKeyboardButton("📁 Portfolio", callback_data="menu_portfolio"),
-    ],
-    [
-        InlineKeyboardButton("⚙️ Settings",  callback_data="menu_settings"),
-        InlineKeyboardButton("🎴 PnL Card",  callback_data="menu_pnl"),
-    ],
-    [
-        InlineKeyboardButton("🔄 Refresh",   callback_data="menu_home"),
-    ],
-])
+def _main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💰 Buy",        callback_data="menu_buy"),
+            InlineKeyboardButton("📤 Sell",        callback_data="menu_sell"),
+        ],
+        [
+            InlineKeyboardButton("📊 Positions",   callback_data="menu_positions"),
+            InlineKeyboardButton("📁 Portfolio",   callback_data="menu_portfolio"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Settings",    callback_data="menu_settings"),
+            InlineKeyboardButton("🎴 PnL Card",    callback_data="menu_pnl"),
+        ],
+        [InlineKeyboardButton("🔄 Refresh",        callback_data="menu_home")],
+    ])
 
 
-def _back_keyboard(callback: str = "menu_home") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=callback)]])
+def _back(to: str = "menu_home", label: str = "← Back") -> list[InlineKeyboardButton]:
+    """Single back-button row, included on every screen."""
+    return [InlineKeyboardButton(label, callback_data=to)]
 
 
-# ---------------------------------------------------------------------------
-# Auth guard
-# ---------------------------------------------------------------------------
-
-async def _get_linked_profile(telegram_id: int) -> dict | None:
-    """Return the linked profile for this Telegram user, or None."""
-    profile = await db.get_profile_by_telegram_id(telegram_id)
-    if profile and profile.get("telegram_linked"):
-        return profile
-    return None
-
-
-async def _require_challenge(telegram_id: int) -> tuple[dict | None, dict | None]:
-    """Return (profile, challenge) or (None, None) if not linked / no active challenge."""
-    profile = await _get_linked_profile(telegram_id)
-    if not profile:
-        return None, None
-    challenge = await db.get_active_challenge(profile["id"])
-    return profile, challenge
+def _cancel_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton("✕ Cancel", callback_data="cancel_conv")]
 
 
 # ---------------------------------------------------------------------------
-# /start
+# Core display helper — edits the active message in place
 # ---------------------------------------------------------------------------
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user    = update.effective_user
-    profile = await _get_linked_profile(user.id)
+async def _show(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    """
+    Edit the user's tracked active message if possible; otherwise send a new one
+    and track it. This keeps the chat to a single bot message at a time.
+    """
+    chat_id = update.effective_chat.id
+    msg_id  = context.user_data.get("active_message_id")
 
-    if profile:
-        await _show_home(update, context, profile)
-    else:
-        await update.message.reply_text(
-            "👋 *Welcome to FundedFrens Trading Bot!*\n\n"
-            "This bot is your Solana trading terminal for your funded prop challenge.\n\n"
-            "To get started, link your FundedFrens account:\n\n"
-            "1. Open the FundedFrens website\n"
-            "2. Go to Profile → Settings\n"
-            "3. Find your *Telegram Link Code* (format: `TG-XXXXXXXXXX`)\n"
-            "4. Send the command: /link `<your code>`\n\n"
-            "Example: `/link TG-ABC1234567`",
-            parse_mode="Markdown",
-        )
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            pass  # Fall through: message may have been deleted or is unchanged
 
-
-# ---------------------------------------------------------------------------
-# /link
-# ---------------------------------------------------------------------------
-
-async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-
-    # If already linked, say so
-    existing = await _get_linked_profile(user.id)
-    if existing:
-        await update.message.reply_text(
-            "✅ Your Telegram is already linked to a FundedFrens account.\n"
-            "Use /home to see your dashboard.",
-        )
-        return
-
-    # Expect the code as an argument
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Please include your link code:\n`/link TG-XXXXXXXXXX`",
-            parse_mode="Markdown",
-        )
-        return
-
-    code = args[0].strip().upper()
-    if not code.startswith("TG-"):
-        await update.message.reply_text(
-            "❌ Invalid code format. Your code should look like `TG-XXXXXXXXXX`.",
-            parse_mode="Markdown",
-        )
-        return
-
-    profile = await db.get_profile_by_link_code(code)
-    if not profile:
-        await update.message.reply_text(
-            "❌ Code not found or already used.\n\n"
-            "• Double-check the code on the FundedFrens website.\n"
-            "• Each code can only be used once per account.",
-        )
-        return
-
-    # Link the account
-    tg_username = user.username  # may be None
-    success = await db.link_telegram(profile["id"], user.id, tg_username)
-    if not success:
-        await update.message.reply_text(
-            "⚠️ Something went wrong linking your account. Please try again.",
-        )
-        return
-
-    await update.message.reply_text(
-        f"✅ *Account linked!*\n\n"
-        f"Welcome, *{profile.get('username', 'Trader')}*! 🎉\n\n"
-        f"Your FundedFrens trading terminal is ready.\n"
-        f"Use /home to view your dashboard.",
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
         parse_mode="Markdown",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
+    context.user_data["active_message_id"] = sent.message_id
+
+
+async def _delete_user_message(update: Update) -> None:
+    """Silently delete the user's inbound text message to keep the chat clean."""
+    if update.message:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+
+def _track_callback_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """When entering a flow from a button press, track that message as active."""
+    if update.callback_query:
+        context.user_data["active_message_id"] = update.callback_query.message.message_id
+
+
+# ---------------------------------------------------------------------------
+# Auth guards
+# ---------------------------------------------------------------------------
+
+async def _linked_profile(telegram_id: int) -> dict | None:
+    p = await db.get_profile_by_telegram_id(telegram_id)
+    return p if (p and p.get("telegram_linked")) else None
+
+
+async def _profile_and_challenge(telegram_id: int) -> tuple[dict | None, dict | None]:
+    p = await _linked_profile(telegram_id)
+    if not p:
+        return None, None
+    c = await db.get_active_challenge(p["id"])
+    return p, c
+
+
+def _uid(update: Update) -> int:
+    return update.effective_user.id
 
 
 # ---------------------------------------------------------------------------
 # Home screen
 # ---------------------------------------------------------------------------
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("active_message_id", None)   # always fresh on /start
+    profile = await _linked_profile(_uid(update))
+    if profile:
+        await _show_home(update, context, profile)
+    else:
+        sent = await update.message.reply_text(
+            "👋 *Welcome to FundedFrens!*\n\n"
+            "Send your link code from the website to connect your account.\n\n"
+            "You can find it at: Profile → Settings → Telegram Link Code\n\n"
+            "Just paste it here — format: `TG-XXXXXXXXXX`",
+            parse_mode="Markdown",
+        )
+        context.user_data["active_message_id"] = sent.message_id
+
+
 async def cmd_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    profile = await _get_linked_profile(user.id)
+    if update.message:
+        await _delete_user_message(update)
+    profile = await _linked_profile(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return
     await _show_home(update, context, profile)
 
 
-async def _show_home(update: Update, context: ContextTypes.DEFAULT_TYPE, profile: dict) -> None:
-    """Render the home screen with live account summary."""
+async def _show_home(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    profile: dict,
+) -> None:
     challenge = await db.get_active_challenge(profile["id"])
 
     if not challenge:
-        text = (
+        await _show(
+            update, context,
             "⚠️ *No Active Challenge*\n\n"
             "You don't have an active funded challenge.\n"
-            f"Visit [{config.APP_URL}]({config.APP_URL}) to purchase one."
+            f"Visit {config.APP_URL} to purchase one.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="menu_home")]]),
         )
-        msg = _get_message(update)
-        if msg:
-            await msg.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
-        else:
-            await update.callback_query.edit_message_text(text, parse_mode="Markdown")
         return
 
-    summary = await db.get_account_summary(profile["id"], challenge)
-
-    sign_pnl  = "+" if summary["realized_pnl"] >= 0 else ""
+    summary   = await db.get_account_summary(profile["id"], challenge)
+    sign      = "+" if summary["realized_pnl"] >= 0 else ""
     pnl_emoji = "🟢" if summary["realized_pnl"] >= 0 else "🔴"
-    plan      = challenge.get("challenge_plan", "—").title()
+    plan      = (challenge.get("challenge_plan") or "—").title()
 
-    text = (
+    await _show(
+        update, context,
         f"🏠 *FundedFrens Dashboard*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 `{profile.get('username', 'Trader')}` • {plan} Plan\n\n"
         f"💰 *Balance:* `{summary['available_sol']:.4f} SOL`\n"
         f"📈 *Invested:* `{summary['invested_sol']:.4f} SOL`\n"
         f"🏦 *Equity:* `{summary['total_equity']:.4f} SOL`\n\n"
-        f"{pnl_emoji} *Realized PnL:* `{sign_pnl}{summary['realized_pnl']:.4f} SOL` "
-        f"(`{sign_pnl}{summary['pnl_pct']:.2f}%`)\n"
+        f"{pnl_emoji} *Realized PnL:* `{sign}{summary['realized_pnl']:.4f} SOL "
+        f"({sign}{summary['pnl_pct']:.2f}%)`\n"
         f"📉 *Drawdown:* `{summary['drawdown_pct']:.2f}%`\n\n"
-        f"🎯 *Challenge:* {challenge.get('challenge_progress', 0):.2f}% complete\n"
-        f"📆 *Trading Days:* {challenge.get('trading_days', 0)}\n"
-        f"📊 *Open Positions:* {challenge.get('open_positions', 0)}/3\n"
-        f"⚡ *Win Rate:* {challenge.get('win_rate', 0):.1f}%\n\n"
-        f"💲 `1 SOL = ${summary['sol_price']:,.2f}`"
+        f"🎯 *Challenge:* `{challenge.get('challenge_progress', 0):.2f}%` complete\n"
+        f"📆 *Trading Days:* `{challenge.get('trading_days', 0)}`\n"
+        f"📊 *Open Positions:* `{challenge.get('open_positions', 0)}/3`\n"
+        f"⚡ *Win Rate:* `{challenge.get('win_rate', 0):.1f}%`\n\n"
+        f"💲 `1 SOL = ${summary['sol_price']:,.2f}`",
+        _main_menu(),
     )
-
-    msg = _get_message(update)
-    if msg:
-        await msg.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
-    else:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD
-        )
 
 
 # ---------------------------------------------------------------------------
-# /buy — conversation flow
+# /link — works via command OR plain text paste
+# ---------------------------------------------------------------------------
+
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await _delete_user_message(update)
+
+    existing = await _linked_profile(_uid(update))
+    if existing:
+        await _show(
+            update, context,
+            "✅ Your account is already linked.\nUse the menu to start trading.",
+            _main_menu(),
+        )
+        return
+
+    args = context.args or []
+    if not args:
+        await _show(
+            update, context,
+            "🔗 *Link Your Account*\n\n"
+            "Paste your link code from the FundedFrens website:\n\n"
+            "Profile → Settings → Telegram Link Code\n\n"
+            "Format: `TG-XXXXXXXXXX`\n\n"
+            "Just send the code — no command needed.",
+        )
+        return
+
+    await _do_link(update, context, args[0])
+
+
+async def _do_link(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str) -> None:
+    code = code.strip().upper()
+    if not code.startswith("TG-"):
+        await _show(update, context,
+            "❌ That doesn't look like a link code.\n\n"
+            "Format: `TG-XXXXXXXXXX`\n"
+            "Find yours at: Profile → Settings → Telegram Link Code"
+        )
+        return
+
+    profile = await db.get_profile_by_link_code(code)
+    if not profile:
+        await _show(update, context,
+            "❌ *Code not found or already used.*\n\n"
+            "• Double-check the code on the website\n"
+            "• Each code links to one account only"
+        )
+        return
+
+    user    = update.effective_user
+    success = await db.link_telegram(profile["id"], user.id, user.username)
+    if not success:
+        await _show(update, context, "⚠️ Something went wrong. Please try again.")
+        return
+
+    await _show(
+        update, context,
+        f"✅ *Account linked!*\n\n"
+        f"Welcome, *{profile.get('username', 'Trader')}* 🎉\n\n"
+        f"Your trading terminal is ready.",
+        _main_menu(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# BUY flow
 # ---------------------------------------------------------------------------
 
 async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    profile, challenge = await _require_challenge(_uid(update))
+    if update.message:
+        await _delete_user_message(update)
+    _track_callback_message(update, context)
+
+    profile, challenge = await _profile_and_challenge(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return ConversationHandler.END
     if not challenge:
-        await _no_challenge(update)
+        await _show_no_challenge(update, context)
         return ConversationHandler.END
 
     context.user_data["profile"]   = profile
     context.user_data["challenge"] = challenge
 
-    msg = _get_message(update)
-    text = "🔍 *Buy Token*\n\nEnter the token symbol, name, or Solana contract address:"
-    if msg:
-        await msg.reply_text(text, parse_mode="Markdown",
-                             reply_markup=InlineKeyboardMarkup([[
-                                 InlineKeyboardButton("Cancel", callback_data="cancel_conv")
-                             ]]))
-    else:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown",
-             reply_markup=InlineKeyboardMarkup([[
-                 InlineKeyboardButton("Cancel", callback_data="cancel_conv")
-             ]]))
+    await _show(update, context,
+        "💰 *Buy Token*\n\n"
+        "Step 1 of 3 — Search\n\n"
+        "Enter a token symbol, name, or Solana contract address:",
+        InlineKeyboardMarkup([_cancel_row()]),
+    )
     return BUY_TOKEN_INPUT
 
 
 async def buy_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.message.text.strip()
-    await update.message.reply_text(f"🔍 Searching for `{query}`...", parse_mode="Markdown")
+    await _delete_user_message(update)
+
+    await _show(update, context,
+        f"💰 *Buy Token*\n\n🔍 Searching for `{query}`...",
+    )
 
     pairs = await trading.search_token(query)
     if not pairs:
-        await update.message.reply_text(
-            "❌ No Solana tokens found. Try a different symbol or paste the contract address."
+        await _show(update, context,
+            "💰 *Buy Token*\n\n"
+            "❌ No Solana tokens found.\n\n"
+            "Try a different symbol or paste the contract address:",
+            InlineKeyboardMarkup([_cancel_row()]),
         )
         return BUY_TOKEN_INPUT
 
@@ -318,66 +366,71 @@ async def buy_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         info = trading.extract_token_info(pair)
         mc   = f"${info['market_cap']:,.0f}" if info["market_cap"] else "N/A"
         rows.append([InlineKeyboardButton(
-            f"{i+1}. {info['symbol']} | MC: {mc} | Liq: ${info['liquidity_usd']:,.0f}",
-            callback_data=f"buy_pick_{i}",
+            f"{i+1}. {info['symbol']} | MC: {mc}",
+            callback_data=f"bpick_{i}",
         )])
-    rows.append([InlineKeyboardButton("Cancel", callback_data="cancel_conv")])
+    rows.append(_cancel_row())
 
-    await update.message.reply_text(
-        "Select a token:",
-        reply_markup=InlineKeyboardMarkup(rows),
+    await _show(update, context,
+        f"💰 *Buy Token*\n\nStep 1 of 3 — Select a token:",
+        InlineKeyboardMarkup(rows),
     )
-    return BUY_TOKEN_INPUT
+    return BUY_PICK_TOKEN
 
 
 async def buy_pick_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    idx   = int(update.callback_query.data.split("_")[-1])
+    idx   = int(update.callback_query.data.split("_")[1])
     pairs = context.user_data.get("search_pairs", [])
+
     if idx >= len(pairs):
-        await update.callback_query.edit_message_text("Session expired. Use /buy to start again.")
+        await _show(update, context, "Session expired. Tap Buy to start again.", _main_menu())
         return ConversationHandler.END
 
-    pair = pairs[idx]
-    info = trading.extract_token_info(pair)
+    info = trading.extract_token_info(pairs[idx])
     context.user_data["selected_token"] = info
 
-    settings  = await db.get_bot_settings(context.user_data["profile"]["id"])
-    default_b = float(settings.get("default_buy_sol") or 0.1)
-    sl        = float(settings.get("default_sl_pct") or 20)
-    tp        = float(settings.get("default_tp_pct") or 50)
+    settings   = await db.get_bot_settings(context.user_data["profile"]["id"])
+    default_b  = float(settings.get("default_buy_sol") or 0.1)
+    sl         = float(settings.get("default_sl_pct")  or 20)
+    tp         = float(settings.get("default_tp_pct")  or 50)
 
-    text = (
-        f"🪙 *{info['name']} ({info['symbol']})*\n"
-        f"`{info['address']}`\n\n"
-        f"💲 Price: `${info['price_usd']:.8f}`\n"
-        f"📊 Market Cap: `${info['market_cap']:,.0f}`\n"
-        f"💧 Liquidity: `${info['liquidity_usd']:,.0f}`\n"
-        f"📈 24h Change: `{info['change_24h']:+.2f}%`\n\n"
-        f"Default settings: SL `{sl}%` | TP `{tp}%`\n\n"
-        f"How much SOL to buy? (default: `{default_b} SOL`)\n"
-        f"Reply with a number, or press the button to use the default."
-    )
+    context.user_data["default_buy"] = default_b
+    context.user_data["sl_pct"]      = sl
+    context.user_data["tp_pct"]      = tp
+    context.user_data["auto_pct"]    = settings.get("default_auto_sell_pct")
 
-    await update.callback_query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Use default ({default_b} SOL)", callback_data=f"buy_amount_{default_b}")],
-            [InlineKeyboardButton("Cancel", callback_data="cancel_conv")],
+    await _show(update, context,
+        f"💰 *Buy Token*\n\n"
+        f"Step 2 of 3 — Amount\n\n"
+        f"🪙 *{info['name']}* (`{info['symbol']}`)\n"
+        f"💲 `${info['price_usd']:.8f}`\n"
+        f"📊 MC: `${info['market_cap']:,.0f}` | Liq: `${info['liquidity_usd']:,.0f}`\n"
+        f"📈 24h: `{info['change_24h']:+.2f}%`\n\n"
+        f"SL: `{sl}%` | TP: `{tp}%` _(from your settings)_\n\n"
+        f"How much SOL to buy?\n"
+        f"Type an amount or tap the default:",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✓ Default — {default_b} SOL", callback_data=f"bamt_{default_b}")],
+            _cancel_row(),
         ]),
     )
     return BUY_AMOUNT_INPUT
 
 
-async def buy_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle typed SOL amount."""
+async def buy_amount_typed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _delete_user_message(update)
     try:
         amount = float(update.message.text.strip())
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a positive number (e.g. `0.5`).", parse_mode="Markdown")
+        info = context.user_data.get("selected_token", {})
+        await _show(update, context,
+            f"💰 *Buy Token* — {info.get('symbol', '')}\n\n"
+            "❌ Enter a positive number (e.g. `0.5`):",
+            InlineKeyboardMarkup([_cancel_row()]),
+        )
         return BUY_AMOUNT_INPUT
 
     context.user_data["buy_amount"] = amount
@@ -385,57 +438,40 @@ async def buy_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def buy_amount_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle 'use default' button click."""
     await update.callback_query.answer()
-    amount = float(update.callback_query.data.split("_")[-1])
+    amount = float(update.callback_query.data.split("_")[1])
     context.user_data["buy_amount"] = amount
-    return await _show_buy_confirm(update, context, via_callback=True)
+    return await _show_buy_confirm(update, context)
 
 
-async def _show_buy_confirm(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    via_callback: bool = False,
-) -> int:
+async def _show_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     info     = context.user_data["selected_token"]
     amount   = context.user_data["buy_amount"]
-    settings = await db.get_bot_settings(context.user_data["profile"]["id"])
-    sl_pct   = float(settings.get("default_sl_pct") or 20)
-    tp_pct   = float(settings.get("default_tp_pct") or 50)
-    auto_pct = settings.get("default_auto_sell_pct")
+    sl_pct   = context.user_data["sl_pct"]
+    tp_pct   = context.user_data["tp_pct"]
+    auto_pct = context.user_data["auto_pct"]
+    auto_s   = f"{float(auto_pct):.0f}%" if auto_pct else "off"
 
-    context.user_data["sl_pct"]   = sl_pct
-    context.user_data["tp_pct"]   = tp_pct
-    context.user_data["auto_pct"] = float(auto_pct) if auto_pct else None
-
-    text = (
-        f"✅ *Confirm Buy*\n\n"
-        f"Token: `{info['symbol']}` — {info['name']}\n"
-        f"Amount: `{amount:.4f} SOL`\n"
-        f"Price: `${info['price_usd']:.8f}`\n"
-        f"Stop Loss: `{sl_pct}%`\n"
-        f"Take Profit: `{tp_pct}%`\n"
-        f"Auto-sell: `{f'{auto_pct}%' if auto_pct else 'off'}`\n\n"
-        f"⚠️ This is a *simulated* trade on your funded demo account."
+    await _show(update, context,
+        f"💰 *Buy Token*\n\n"
+        f"Step 3 of 3 — Confirm\n\n"
+        f"🪙 `{info['symbol']}` — {info['name']}\n"
+        f"💵 Amount: `{amount:.4f} SOL`\n"
+        f"🛑 Stop Loss: `{sl_pct}%`\n"
+        f"🎯 Take Profit: `{tp_pct}%`\n"
+        f"⚡ Auto-sell: `{auto_s}`\n\n"
+        f"_Simulated trade on your funded demo account._",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm Buy", callback_data="buy_confirm")],
+            _cancel_row(),
+        ]),
     )
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Confirm Buy", callback_data="buy_confirm"),
-            InlineKeyboardButton("❌ Cancel",       callback_data="cancel_conv"),
-        ],
-    ])
-
-    if via_callback:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-
     return BUY_CONFIRM
 
 
 async def buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    await update.callback_query.edit_message_text("⏳ Executing buy...")
+    await _show(update, context, "⏳ Executing buy...")
 
     profile   = context.user_data["profile"]
     challenge = context.user_data["challenge"]
@@ -445,15 +481,14 @@ async def buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     tp_pct    = context.user_data["tp_pct"]
     auto_pct  = context.user_data["auto_pct"]
 
-    # Fetch live price for the actual entry
     pair = await trading.get_token_price(info["address"])
     if pair:
         from database import _fetch_sol_price
-        sol_price    = await _fetch_sol_price()
-        entry_price  = trading.price_in_sol(pair, sol_price)
-        market_cap   = float(pair.get("marketCap") or pair.get("fdv") or 0)
+        sol_price   = await _fetch_sol_price()
+        entry_price = trading.price_in_sol(pair, sol_price)
+        market_cap  = float(pair.get("marketCap") or pair.get("fdv") or 0)
     else:
-        entry_price = info["price_usd"]  # fallback
+        entry_price = info["price_usd"]
         sol_price   = 150.0
         market_cap  = info["market_cap"]
 
@@ -469,50 +504,54 @@ async def buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         entry_market_cap_usd=market_cap,
         stop_loss_pct=sl_pct,
         take_profit_pct=tp_pct,
-        auto_sell_pct=auto_pct,
+        auto_sell_pct=float(auto_pct) if auto_pct else None,
     )
 
     if result["ok"]:
-        await update.callback_query.edit_message_text(
+        await _show(update, context,
             f"✅ *Buy Executed!*\n\n"
-            f"Token: `{info['symbol']}`\n"
-            f"Invested: `{amount:.4f} SOL`\n"
-            f"Entry Price: `${entry_price * (sol_price or 150):.8f}`\n\n"
-            f"Position ID: `{result['position_id']}`\n"
-            f"SL: `{sl_pct}%` | TP: `{tp_pct}%`\n\n"
-            f"Use /positions to monitor your trade.",
-            parse_mode="Markdown",
+            f"🪙 `{info['symbol']}` — Position #{result['position_id']}\n"
+            f"💵 Invested: `{amount:.4f} SOL`\n"
+            f"📍 Entry: `${entry_price * sol_price:.8f}`\n\n"
+            f"SL: `{sl_pct}%` | TP: `{tp_pct}%`",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 View Positions", callback_data="menu_positions")],
+                [InlineKeyboardButton("🏠 Home",           callback_data="menu_home")],
+            ]),
         )
     else:
-        await update.callback_query.edit_message_text(
+        await _show(update, context,
             f"❌ *Buy Failed*\n\n{result.get('error', 'Unknown error.')}",
-            parse_mode="Markdown",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]]),
         )
 
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
-# /sell — conversation flow
+# SELL flow
 # ---------------------------------------------------------------------------
 
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    profile, challenge = await _require_challenge(_uid(update))
+    if update.message:
+        await _delete_user_message(update)
+    _track_callback_message(update, context)
+
+    profile, challenge = await _profile_and_challenge(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return ConversationHandler.END
     if not challenge:
-        await _no_challenge(update)
+        await _show_no_challenge(update, context)
         return ConversationHandler.END
 
     positions = await db.get_open_positions(profile["id"])
     if not positions:
-        msg = _get_message(update)
-        text = "📂 You have no open positions to sell."
-        if msg:
-            await msg.reply_text(text)
-        else:
-            await update.callback_query.edit_message_text(text)
+        await _show(update, context,
+            "📤 *Sell*\n\nYou have no open positions.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("💰 Buy Token", callback_data="menu_buy")],
+                                   _back()]),
+        )
         return ConversationHandler.END
 
     context.user_data["profile"]   = profile
@@ -523,118 +562,112 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     for p in positions:
         rows.append([InlineKeyboardButton(
             f"#{p['id']} {p['token_symbol']} — {float(p['amount_sol_invested']):.4f} SOL",
-            callback_data=f"sell_pos_{p['id']}",
+            callback_data=f"spos_{p['id']}",
         )])
-    rows.append([InlineKeyboardButton("Cancel", callback_data="cancel_conv")])
+    rows.append(_back())
 
-    text = "📤 *Sell Position*\n\nSelect a position to sell:"
-    msg  = _get_message(update)
-    if msg:
-        await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-    else:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-
+    await _show(update, context,
+        "📤 *Sell Position*\n\nSelect which position to sell:",
+        InlineKeyboardMarkup(rows),
+    )
     return SELL_SELECT
 
 
-async def sell_select_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def sell_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    pos_id    = int(update.callback_query.data.split("_")[-1])
+    pos_id    = int(update.callback_query.data.split("_")[1])
     positions = context.user_data.get("positions", [])
     position  = next((p for p in positions if p["id"] == pos_id), None)
+
     if not position:
-        await update.callback_query.edit_message_text("Position not found.")
+        await _show(update, context, "Position not found.", _main_menu())
         return ConversationHandler.END
 
     context.user_data["sell_position"] = position
+    invested = float(position["amount_sol_invested"])
 
-    text = (
-        f"📤 *Sell: {position['token_symbol']}*\n\n"
-        f"Invested: `{float(position['amount_sol_invested']):.4f} SOL`\n\n"
-        f"How much would you like to sell?\n"
-        f"Reply with a percentage (e.g. `50` for 50%) or `100` for all."
+    await _show(update, context,
+        f"📤 *Sell — {position['token_symbol']}*\n\n"
+        f"Invested: `{invested:.4f} SOL`\n\n"
+        f"How much to sell? Tap a button or type a percentage (1–100):",
+        InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("25%",  callback_data="spct_25"),
+                InlineKeyboardButton("50%",  callback_data="spct_50"),
+                InlineKeyboardButton("75%",  callback_data="spct_75"),
+                InlineKeyboardButton("100%", callback_data="spct_100"),
+            ],
+            _back("menu_sell"),
+        ]),
     )
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("25%",  callback_data="sell_pct_25"),
-            InlineKeyboardButton("50%",  callback_data="sell_pct_50"),
-            InlineKeyboardButton("75%",  callback_data="sell_pct_75"),
-            InlineKeyboardButton("100%", callback_data="sell_pct_100"),
-        ],
-        [InlineKeyboardButton("Cancel", callback_data="cancel_conv")],
-    ])
-    await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
     return SELL_PCT_INPUT
 
 
 async def sell_pct_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    pct = float(update.callback_query.data.split("_")[-1])
+    pct = float(update.callback_query.data.split("_")[1])
     context.user_data["sell_pct"] = pct
-    return await _show_sell_confirm(update, context, via_callback=True)
+    return await _show_sell_confirm(update, context)
 
 
-async def sell_pct_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def sell_pct_typed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _delete_user_message(update)
     try:
         pct = float(update.message.text.strip())
         if not (1 <= pct <= 100):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a number between 1 and 100.")
+        pos = context.user_data.get("sell_position", {})
+        await _show(update, context,
+            f"📤 *Sell — {pos.get('token_symbol', '')}*\n\n"
+            "❌ Enter a number between 1 and 100:",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("25%", callback_data="spct_25"),
+                 InlineKeyboardButton("50%", callback_data="spct_50"),
+                 InlineKeyboardButton("75%", callback_data="spct_75"),
+                 InlineKeyboardButton("100%", callback_data="spct_100")],
+                _back("menu_sell"),
+            ]),
+        )
         return SELL_PCT_INPUT
 
     context.user_data["sell_pct"] = pct
     return await _show_sell_confirm(update, context)
 
 
-async def _show_sell_confirm(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    via_callback: bool = False,
-) -> int:
+async def _show_sell_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     position = context.user_data["sell_position"]
     pct      = context.user_data["sell_pct"]
+    invested = float(position["amount_sol_invested"])
 
-    invested  = float(position["amount_sol_invested"])
-    sell_sol  = invested * pct / 100
-
-    text = (
-        f"✅ *Confirm Sell*\n\n"
+    await _show(update, context,
+        f"📤 *Sell — Confirm*\n\n"
         f"Token: `{position['token_symbol']}`\n"
-        f"Sell: `{pct:.0f}%` → ~`{sell_sol:.4f} SOL` at current price\n\n"
-        f"⚠️ This is a *simulated* trade on your funded demo account."
+        f"Selling: `{pct:.0f}%` of position\n"
+        f"≈ `{invested * pct / 100:.4f} SOL` at current price\n\n"
+        f"_Simulated trade on your funded demo account._",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm Sell", callback_data="sell_confirm")],
+            _back("menu_sell"),
+        ]),
     )
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Confirm Sell", callback_data="sell_confirm"),
-            InlineKeyboardButton("❌ Cancel",        callback_data="cancel_conv"),
-        ],
-    ])
-    if via_callback:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-
     return SELL_CONFIRM
 
 
 async def sell_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    await update.callback_query.edit_message_text("⏳ Executing sell...")
+    await _show(update, context, "⏳ Executing sell...")
 
     position = context.user_data["sell_position"]
     pct      = context.user_data["sell_pct"]
 
-    # Fetch live exit price
     pair = await trading.get_token_price(position["token_address"])
     if pair:
         from database import _fetch_sol_price
         sol_price  = await _fetch_sol_price()
         exit_price = trading.price_in_sol(pair, sol_price)
     else:
-        # Can't fetch price — use entry as fallback (0% PnL)
         exit_price = float(position["entry_price_sol"])
-        sol_price  = 150.0
 
     result = await trading.execute_sell(
         position_id=position["id"],
@@ -646,53 +679,53 @@ async def sell_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     sign  = "+" if result["pnl_sol"] >= 0 else ""
     emoji = "🟢" if result["pnl_sol"] >= 0 else "🔴"
 
-    await update.callback_query.edit_message_text(
+    await _show(update, context,
         f"{emoji} *Sell Executed!*\n\n"
         f"Token: `{result['token_symbol']}`\n"
         f"Sold: `{pct:.0f}%` of position\n"
         f"Received: `{result['received_sol']:.4f} SOL`\n"
         f"PnL: `{sign}{result['pnl_sol']:.4f} SOL ({sign}{result['pnl_pct']:.2f}%)`",
-        parse_mode="Markdown",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 View Positions", callback_data="menu_positions")],
+            [InlineKeyboardButton("🏠 Home",           callback_data="menu_home")],
+        ]),
     )
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
-# /positions — open positions with live PnL
+# Positions
 # ---------------------------------------------------------------------------
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    profile, challenge = await _require_challenge(_uid(update))
+    if update.message:
+        await _delete_user_message(update)
+    _track_callback_message(update, context)
+
+    profile = await _linked_profile(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return
 
     positions = await db.get_open_positions(profile["id"])
 
-    msg  = _get_message(update)
-    send = msg.reply_text if msg else update.callback_query.edit_message_text
-
     if not positions:
-        await send(
-            "📊 *Open Positions*\n\n"
-            "You have no open positions.\n"
-            "Use /buy to open one.",
-            parse_mode="Markdown",
-            reply_markup=_back_keyboard(),
+        await _show(update, context,
+            "📊 *Open Positions*\n\nNo open positions yet.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Buy Token", callback_data="menu_buy")],
+                _back(),
+            ]),
         )
         return
 
-    # Fetch live prices for all tokens in parallel
     from database import _fetch_sol_price
     sol_price = await _fetch_sol_price()
 
     lines = ["📊 *Open Positions*\n"]
     for p in positions:
         pair = await trading.get_token_price(p["token_address"])
-        if pair:
-            current = trading.price_in_sol(pair, sol_price)
-        else:
-            current = float(p["entry_price_sol"])
+        current = trading.price_in_sol(pair, sol_price) if pair else float(p["entry_price_sol"])
 
         entry   = float(p["entry_price_sol"])
         inv     = float(p["amount_sol_invested"])
@@ -700,44 +733,47 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pnl_sol = inv * pnl_pct / 100
         sign    = "+" if pnl_sol >= 0 else ""
         emoji   = "🟢" if pnl_sol >= 0 else "🔴"
-
-        sl_txt  = f"SL {p['stop_loss_pct']}%" if p.get("stop_loss_pct") else "—"
-        tp_txt  = f"TP {p['take_profit_pct']}%" if p.get("take_profit_pct") else "—"
+        sl_s    = f"SL {p['stop_loss_pct']}%" if p.get("stop_loss_pct") else "—"
+        tp_s    = f"TP {p['take_profit_pct']}%" if p.get("take_profit_pct") else "—"
 
         lines.append(
             f"{emoji} *{p['token_symbol']}* (#{p['id']})\n"
-            f"  Invested: `{inv:.4f} SOL`\n"
-            f"  PnL: `{sign}{pnl_sol:.4f} SOL ({sign}{pnl_pct:.2f}%)`\n"
-            f"  {sl_txt} | {tp_txt}\n"
+            f"  `{inv:.4f} SOL` | `{sign}{pnl_sol:.4f} SOL ({sign}{pnl_pct:.2f}%)`\n"
+            f"  {sl_s} | {tp_s}\n"
         )
 
-    await send(
+    await _show(update, context,
         "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=_back_keyboard(),
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Sell a Position", callback_data="menu_sell")],
+            _back(),
+        ]),
     )
 
 
 # ---------------------------------------------------------------------------
-# /portfolio — recent trade history
+# Portfolio
 # ---------------------------------------------------------------------------
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    profile = await _get_linked_profile(_uid(update))
+    if update.message:
+        await _delete_user_message(update)
+    _track_callback_message(update, context)
+
+    profile = await _linked_profile(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return
 
     trades = await db.get_trades(profile["id"], limit=15)
 
-    msg  = _get_message(update)
-    send = msg.reply_text if msg else update.callback_query.edit_message_text
-
     if not trades:
-        await send(
-            "📁 *Portfolio*\n\nNo trades yet. Use /buy to make your first trade.",
-            parse_mode="Markdown",
-            reply_markup=_back_keyboard(),
+        await _show(update, context,
+            "📁 *Portfolio*\n\nNo trades yet.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Make your first trade", callback_data="menu_buy")],
+                _back(),
+            ]),
         )
         return
 
@@ -746,151 +782,143 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         side  = "🟢 BUY" if t["side"] == "buy" else "🔴 SELL"
         date  = (t.get("created_at") or "")[:10]
         sol   = float(t.get("amount_sol") or 0)
-        pnl   = t.get("pnl_sol")
-
-        line  = f"{side} `{t['token_symbol']}` — `{sol:.4f} SOL` ({date})"
-        if pnl is not None:
-            pnl_f = float(pnl)
-            sign  = "+" if pnl_f >= 0 else ""
-            line += f"\n  PnL: `{sign}{pnl_f:.4f} SOL`"
+        line  = f"{side} `{t['token_symbol']}` — `{sol:.4f} SOL` _{date}_"
+        if t.get("pnl_sol") is not None:
+            pnl  = float(t["pnl_sol"])
+            sign = "+" if pnl >= 0 else ""
+            line += f"\n  → `{sign}{pnl:.4f} SOL`"
         lines.append(line)
 
-    await send(
+    await _show(update, context,
         "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=_back_keyboard(),
+        InlineKeyboardMarkup([_back()]),
     )
 
 
 # ---------------------------------------------------------------------------
-# /settings
+# Settings
 # ---------------------------------------------------------------------------
 
-SETTINGS_FIELDS = {
-    "buy":       ("default_buy_sol",       "Default buy amount in SOL (e.g. 0.1)"),
-    "sl":        ("default_sl_pct",        "Default stop-loss % (e.g. 20)"),
-    "tp":        ("default_tp_pct",        "Default take-profit % (e.g. 50)"),
-    "autosell":  ("default_auto_sell_pct", "Auto-sell at % profit (0 to disable)"),
+_SETTINGS_FIELDS = {
+    "buy":      ("default_buy_sol",       "Default buy amount in SOL (e.g. `0.1`)"),
+    "sl":       ("default_sl_pct",        "Stop-loss % (e.g. `20`)"),
+    "tp":       ("default_tp_pct",        "Take-profit % (e.g. `50`)"),
+    "autosell": ("default_auto_sell_pct", "Auto-sell at % profit (`0` to disable)"),
 }
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    profile = await _get_linked_profile(_uid(update))
+    if update.message:
+        await _delete_user_message(update)
+    _track_callback_message(update, context)
+
+    profile = await _linked_profile(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return ConversationHandler.END
 
-    settings = await db.get_bot_settings(profile["id"])
-    context.user_data["profile"]  = profile
-    context.user_data["settings"] = settings
+    context.user_data["profile"] = profile
+    return await _show_settings_menu(update, context, profile)
 
-    buy    = float(settings.get("default_buy_sol") or 0.1)
-    sl     = float(settings.get("default_sl_pct")  or 20)
-    tp     = float(settings.get("default_tp_pct")  or 50)
-    auto   = settings.get("default_auto_sell_pct")
+
+async def _show_settings_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    profile: dict,
+) -> int:
+    s     = await db.get_bot_settings(profile["id"])
+    buy   = float(s.get("default_buy_sol") or 0.1)
+    sl    = float(s.get("default_sl_pct")  or 20)
+    tp    = float(s.get("default_tp_pct")  or 50)
+    auto  = s.get("default_auto_sell_pct")
     auto_s = f"{float(auto):.0f}%" if auto else "off"
 
-    text = (
+    await _show(update, context,
         f"⚙️ *Trading Settings*\n\n"
         f"Buy Amount: `{buy:.4f} SOL`\n"
         f"Stop Loss: `{sl}%`\n"
         f"Take Profit: `{tp}%`\n"
         f"Auto-sell: `{auto_s}`\n\n"
-        f"Tap a setting to change it:"
+        f"Tap a setting to change it:",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💰 Buy: {buy:.2f} SOL", callback_data="setf_buy"),
+             InlineKeyboardButton(f"🛑 SL: {sl}%",          callback_data="setf_sl")],
+            [InlineKeyboardButton(f"🎯 TP: {tp}%",           callback_data="setf_tp"),
+             InlineKeyboardButton(f"⚡ Auto: {auto_s}",      callback_data="setf_autosell")],
+            _back(),
+        ]),
     )
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"Buy: {buy:.2f} SOL", callback_data="set_buy"),
-            InlineKeyboardButton(f"SL: {sl}%",          callback_data="set_sl"),
-        ],
-        [
-            InlineKeyboardButton(f"TP: {tp}%",           callback_data="set_tp"),
-            InlineKeyboardButton(f"Auto-sell: {auto_s}", callback_data="set_autosell"),
-        ],
-        [InlineKeyboardButton("← Back", callback_data="menu_home")],
-    ])
-
-    msg = _get_message(update)
-    if msg:
-        await msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-
-    return SETTINGS_FIELD
+    return SETTINGS_PICK
 
 
-async def settings_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def settings_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    key = update.callback_query.data[4:]   # strip "set_"
-    if key not in SETTINGS_FIELDS:
+    key = update.callback_query.data[5:]   # strip "setf_"
+    if key not in _SETTINGS_FIELDS:
         return ConversationHandler.END
 
     context.user_data["settings_key"] = key
-    _, description = SETTINGS_FIELDS[key]
-    await update.callback_query.edit_message_text(
-        f"⚙️ *Edit Setting*\n\n{description}:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("Cancel", callback_data="cancel_conv")
-        ]]),
+    _, description = _SETTINGS_FIELDS[key]
+
+    await _show(update, context,
+        f"⚙️ *Settings*\n\n{description}:",
+        InlineKeyboardMarkup([_back("menu_settings")]),
     )
     return SETTINGS_VALUE
 
 
-async def settings_value_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    key          = context.user_data.get("settings_key")
-    db_field, _  = SETTINGS_FIELDS.get(key, (None, None))
+async def settings_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _delete_user_message(update)
+    key      = context.user_data.get("settings_key")
+    db_field = _SETTINGS_FIELDS.get(key, (None,))[0]
     if not db_field:
         return ConversationHandler.END
 
-    raw = update.message.text.strip()
     try:
-        value = float(raw)
+        value = float(update.message.text.strip())
         if value < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a valid positive number.")
+        await _show(update, context,
+            "⚙️ *Settings*\n\n❌ Enter a valid positive number:",
+            InlineKeyboardMarkup([_back("menu_settings")]),
+        )
         return SETTINGS_VALUE
 
-    # 0 means disable for auto_sell
-    if db_field == "default_auto_sell_pct" and value == 0:
-        value = None
+    save_value = None if (db_field == "default_auto_sell_pct" and value == 0) else value
+    profile    = context.user_data["profile"]
+    await db.upsert_bot_settings(profile["id"], **{db_field: save_value})
 
-    profile = context.user_data["profile"]
-    await db.upsert_bot_settings(profile["id"], **{db_field: value})
-
-    await update.message.reply_text(
-        f"✅ Setting updated! Use /settings to view all.",
-        reply_markup=_back_keyboard("menu_home"),
-    )
-    return ConversationHandler.END
+    await _show_settings_menu(update, context, profile)
+    return SETTINGS_PICK
 
 
 # ---------------------------------------------------------------------------
-# /pnl — generate PnL card
+# PnL card
 # ---------------------------------------------------------------------------
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    profile, challenge = await _require_challenge(_uid(update))
+    if update.message:
+        await _delete_user_message(update)
+    _track_callback_message(update, context)
+
+    profile, challenge = await _profile_and_challenge(_uid(update))
     if not profile:
-        await _not_linked(update)
+        await _show_not_linked(update, context)
         return
     if not challenge:
-        await _no_challenge(update)
+        await _show_no_challenge(update, context)
         return
 
-    msg  = _get_message(update)
-    send = msg.reply_text if msg else update.callback_query.edit_message_text
-    await send("🎴 Generating your PnL card...")
+    await _show(update, context, "🎴 Generating your PnL card...")
 
     summary = await db.get_account_summary(profile["id"], challenge)
     trades  = await db.get_trades(profile["id"], limit=1000)
 
     sell_trades  = [t for t in trades if t.get("side") == "sell"]
     total_trades = len(trades)
-    total_sells  = len(sell_trades)
     winners      = sum(1 for t in sell_trades if float(t.get("pnl_sol") or 0) > 0)
-    win_rate     = winners / total_sells * 100 if total_sells else 0.0
+    win_rate     = winners / len(sell_trades) * 100 if sell_trades else 0.0
     trading_days = len({t["created_at"][:10] for t in trades if t.get("created_at")})
 
     img_bytes = generate_pnl_card(
@@ -908,17 +936,46 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         sol_price=summary["sol_price"],
     )
 
-    chat_id = update.effective_chat.id
     await context.bot.send_photo(
-        chat_id=chat_id,
+        chat_id=update.effective_chat.id,
         photo=img_bytes,
         caption=f"🎴 *PnL Card — {profile.get('username', 'Trader')}*",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([_back()]),
     )
 
 
 # ---------------------------------------------------------------------------
-# Callback router (main menu buttons)
+# Global text catch-all
+# ---------------------------------------------------------------------------
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles any plain text sent outside a conversation.
+    - TG-... codes are treated as link attempts (no /link needed)
+    - Anything else shows the home dashboard or link prompt
+    """
+    text = update.message.text.strip()
+    await _delete_user_message(update)
+
+    if text.upper().startswith("TG-"):
+        context.args = [text]
+        await cmd_link(update, context)
+        return
+
+    profile = await _linked_profile(_uid(update))
+    if profile:
+        await _show_home(update, context, profile)
+    else:
+        await _show(update, context,
+            "👋 Paste your FundedFrens link code to get started.\n\n"
+            "Format: `TG-XXXXXXXXXX`\n\n"
+            "Find it at: Profile → Settings → Telegram Link Code",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Inline button router
 # ---------------------------------------------------------------------------
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -926,62 +983,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = q.data
     await q.answer()
 
+    _track_callback_message(update, context)
+
     if data == "menu_home":
-        profile = await _get_linked_profile(q.from_user.id)
+        profile = await _linked_profile(q.from_user.id)
         if profile:
             await _show_home(update, context, profile)
         else:
-            await q.edit_message_text("You are not linked. Use /link to connect your account.")
-    elif data == "menu_buy":
-        await cmd_buy(update, context)
-    elif data == "menu_sell":
-        await cmd_sell(update, context)
+            await _show(update, context,
+                "You're not linked yet. Paste your `TG-XXXXXXXXXX` code to get started."
+            )
     elif data == "menu_positions":
         await cmd_positions(update, context)
     elif data == "menu_portfolio":
         await cmd_portfolio(update, context)
-    elif data == "menu_settings":
-        await cmd_settings(update, context)
     elif data == "menu_pnl":
         await cmd_pnl(update, context)
     elif data == "cancel_conv":
-        await q.edit_message_text("Cancelled. Use /home to return to the dashboard.")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _uid(update: Update) -> int:
-    return update.effective_user.id
-
-
-def _get_message(update: Update):
-    return update.message if update.message else None
-
-
-async def _not_linked(update: Update) -> None:
-    text = (
-        "🔗 Your Telegram is not linked to a FundedFrens account.\n\n"
-        "Use /link `<your code>` to connect."
-    )
-    msg = _get_message(update)
-    if msg:
-        await msg.reply_text(text, parse_mode="Markdown")
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
-
-
-async def _no_challenge(update: Update) -> None:
-    text = (
-        f"⚠️ No active funded challenge found.\n"
-        f"Visit {config.APP_URL} to purchase one."
-    )
-    msg = _get_message(update)
-    if msg:
-        await msg.reply_text(text)
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text)
+        profile = await _linked_profile(q.from_user.id)
+        if profile:
+            await _show_home(update, context, profile)
+        else:
+            await _show(update, context,
+                "Paste your `TG-XXXXXXXXXX` link code to get started."
+            )
+    elif data == "help_link":
+        await _show(update, context,
+            "🔗 *How to link your account*\n\n"
+            "1. Open fundedfrens.com\n"
+            "2. Sign in and go to Profile\n"
+            "3. Find your Telegram Link Code\n"
+            "4. Copy it and paste it here\n\n"
+            "Format: `TG-XXXXXXXXXX`"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -991,30 +1025,80 @@ async def _no_challenge(update: Update) -> None:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled exception", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(
-            "⚠️ An unexpected error occurred. Please try again."
-        )
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong. Please try again."
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
-# Application setup
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-def _build_buy_conv() -> ConversationHandler:
+async def _show_not_linked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show(update, context,
+        "🔗 Account not linked.\n\nPaste your `TG-XXXXXXXXXX` code from fundedfrens.com to connect."
+    )
+
+
+async def _show_no_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show(update, context,
+        f"⚠️ No active challenge.\n\nVisit {config.APP_URL} to purchase one.",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="menu_home")]]),
+    )
+
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message:
+        await _delete_user_message(update)
+    profile = await _linked_profile(_uid(update))
+    if profile:
+        await _show_home(update, context, profile)
+    else:
+        await _show(update, context, "Paste your link code to get started.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Background monitor job (uses job_queue — not asyncio.create_task)
+# ---------------------------------------------------------------------------
+
+async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Periodic position monitor. Registered with app.job_queue.run_repeating()
+    so PTB manages its lifecycle cleanly on startup and shutdown — this prevents
+    the 'Task was destroyed but it is pending!' error on Render restarts.
+    """
+    try:
+        await trading.check_all_positions(context.application)
+    except Exception as e:
+        log.error("Monitor job error: %s", e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Conversation handlers
+# ---------------------------------------------------------------------------
+
+def _buy_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
-            CommandHandler("buy", cmd_buy),
+            CommandHandler("buy",  cmd_buy),
             CallbackQueryHandler(cmd_buy, pattern="^menu_buy$"),
         ],
         states={
             BUY_TOKEN_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, buy_token_input),
-                CallbackQueryHandler(buy_pick_token,   pattern=r"^buy_pick_\d+$"),
+                CallbackQueryHandler(cancel_conv, pattern="^cancel_conv$"),
+            ],
+            BUY_PICK_TOKEN: [
+                CallbackQueryHandler(buy_pick_token,   pattern=r"^bpick_\d+$"),
                 CallbackQueryHandler(cancel_conv,       pattern="^cancel_conv$"),
             ],
             BUY_AMOUNT_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount_input),
-                CallbackQueryHandler(buy_amount_default, pattern=r"^buy_amount_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount_typed),
+                CallbackQueryHandler(buy_amount_default, pattern=r"^bamt_"),
                 CallbackQueryHandler(cancel_conv,         pattern="^cancel_conv$"),
             ],
             BUY_CONFIRM: [
@@ -1024,13 +1108,15 @@ def _build_buy_conv() -> ConversationHandler:
         },
         fallbacks=[
             CommandHandler("cancel", cancel_conv),
+            CommandHandler("home",   cancel_conv),
             CallbackQueryHandler(cancel_conv, pattern="^cancel_conv$"),
+            CallbackQueryHandler(cancel_conv, pattern="^menu_home$"),
         ],
         allow_reentry=True,
     )
 
 
-def _build_sell_conv() -> ConversationHandler:
+def _sell_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
             CommandHandler("sell", cmd_sell),
@@ -1038,84 +1124,66 @@ def _build_sell_conv() -> ConversationHandler:
         ],
         states={
             SELL_SELECT: [
-                CallbackQueryHandler(sell_select_position, pattern=r"^sell_pos_\d+$"),
-                CallbackQueryHandler(cancel_conv,           pattern="^cancel_conv$"),
+                CallbackQueryHandler(sell_select, pattern=r"^spos_\d+$"),
+                CallbackQueryHandler(cancel_conv, pattern="^(cancel_conv|menu_home)$"),
             ],
             SELL_PCT_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, sell_pct_input),
-                CallbackQueryHandler(sell_pct_button,  pattern=r"^sell_pct_\d+$"),
-                CallbackQueryHandler(cancel_conv,       pattern="^cancel_conv$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sell_pct_typed),
+                CallbackQueryHandler(sell_pct_button,  pattern=r"^spct_\d+$"),
+                CallbackQueryHandler(cancel_conv,       pattern="^(cancel_conv|menu_sell|menu_home)$"),
             ],
             SELL_CONFIRM: [
                 CallbackQueryHandler(sell_confirm, pattern="^sell_confirm$"),
-                CallbackQueryHandler(cancel_conv,  pattern="^cancel_conv$"),
+                CallbackQueryHandler(cancel_conv,  pattern="^(cancel_conv|menu_sell|menu_home)$"),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_conv),
-            CallbackQueryHandler(cancel_conv, pattern="^cancel_conv$"),
+            CommandHandler("home",   cancel_conv),
+            CallbackQueryHandler(cancel_conv, pattern="^(cancel_conv|menu_home)$"),
         ],
         allow_reentry=True,
     )
 
 
-def _build_settings_conv() -> ConversationHandler:
+def _settings_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
             CommandHandler("settings", cmd_settings),
             CallbackQueryHandler(cmd_settings, pattern="^menu_settings$"),
         ],
         states={
-            SETTINGS_FIELD: [
-                CallbackQueryHandler(settings_pick_field, pattern=r"^set_"),
-                CallbackQueryHandler(cancel_conv,          pattern="^cancel_conv$"),
+            SETTINGS_PICK: [
+                CallbackQueryHandler(settings_pick, pattern=r"^setf_"),
+                CallbackQueryHandler(cancel_conv,    pattern="^(cancel_conv|menu_home)$"),
             ],
             SETTINGS_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, settings_value_input),
-                CallbackQueryHandler(cancel_conv, pattern="^cancel_conv$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, settings_value),
+                CallbackQueryHandler(cancel_conv, pattern="^(cancel_conv|menu_settings|menu_home)$"),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_conv),
-            CallbackQueryHandler(cancel_conv, pattern="^cancel_conv$"),
+            CommandHandler("home",   cancel_conv),
+            CallbackQueryHandler(cancel_conv, pattern="^(cancel_conv|menu_home)$"),
         ],
         allow_reentry=True,
     )
-
-
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    msg = _get_message(update)
-    if msg:
-        await msg.reply_text("Cancelled. Use /home to return to the dashboard.")
-    elif update.callback_query:
-        await update.callback_query.edit_message_text("Cancelled. Use /home to return to the dashboard.")
-    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def _post_init(app: Application) -> None:
-    """Start background position monitor after the bot initializes."""
-    asyncio.create_task(trading.monitor_positions(app))
-    log.info("Position monitor started.")
-
-
 def main() -> None:
     log.info("Starting FundedFrens Trading Bot...")
 
-    app = (
-        Application.builder()
-        .token(config.BOT_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    app = Application.builder().token(config.BOT_TOKEN).build()
 
-    # Conversation handlers (must be registered before generic callback handler)
-    app.add_handler(_build_buy_conv())
-    app.add_handler(_build_sell_conv())
-    app.add_handler(_build_settings_conv())
+    # Conversation handlers first (higher priority than generic handlers)
+    app.add_handler(_buy_conv())
+    app.add_handler(_sell_conv())
+    app.add_handler(_settings_conv())
 
     # Simple command handlers
     app.add_handler(CommandHandler("start",     cmd_start))
@@ -1125,13 +1193,23 @@ def main() -> None:
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("pnl",       cmd_pnl))
 
-    # Generic inline-button router (home menu buttons not covered by convs)
+    # Generic button router (for menu buttons not handled by conversations)
     app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Global text catch-all (lowest priority — only fires outside conversations)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Error handler
     app.add_error_handler(error_handler)
 
-    log.info("Bot polling started. Press Ctrl+C to stop.")
+    # Background position monitor via job_queue (clean lifecycle, no asyncio.create_task)
+    app.job_queue.run_repeating(
+        monitor_job,
+        interval=TRADING.monitor_interval_seconds,
+        first=10,
+    )
+
+    log.info("Bot polling started.")
     app.run_polling(drop_pending_updates=True)
 
 

@@ -8,12 +8,11 @@ Integrates with:
 
 Field name corrections from the original bot:
   - profile["auth_user_id"] → profile["id"]
-  - positions.user_id is already profiles.id (UUID) — no change to DB queries
+  - positions.user_id is profiles.id (UUID) — all DB queries use this
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -33,7 +32,7 @@ log = logging.getLogger(__name__)
 async def search_token(query: str) -> list[dict]:
     """
     Search DexScreener for Solana tokens matching `query`.
-    Returns a list of pair dicts (sorted by liquidity desc, top 5).
+    Returns up to 5 pairs sorted by liquidity (desc).
     """
     url = f"{TRADING.dexscreener_base}/search?q={query}"
     try:
@@ -61,7 +60,7 @@ async def search_token(query: str) -> list[dict]:
 async def get_token_price(token_address: str) -> dict | None:
     """
     Fetch current price data for a specific Solana token address.
-    Returns the best pair dict (highest liquidity) or None.
+    Returns the highest-liquidity pair or None.
     """
     url = f"{TRADING.dexscreener_base}/tokens/{token_address}"
     try:
@@ -89,16 +88,12 @@ async def get_token_price(token_address: str) -> dict | None:
 
 
 def price_in_sol(pair: dict, sol_price_usd: float) -> float:
-    """
-    Convert a DexScreener pair's priceUsd to a SOL-denominated price.
-    Returns 0.0 if data is missing.
-    """
+    """Convert a DexScreener pair's priceUsd to SOL-denominated price."""
     price_usd_raw = pair.get("priceUsd") or pair.get("priceNative")
     if not price_usd_raw or sol_price_usd <= 0:
         return 0.0
     try:
-        price_usd = float(price_usd_raw)
-        return price_usd / sol_price_usd
+        return float(price_usd_raw) / sol_price_usd
     except (ValueError, TypeError):
         return 0.0
 
@@ -129,7 +124,7 @@ def extract_token_info(pair: dict) -> dict[str, Any]:
 
 async def execute_buy(
     *,
-    user_id: str,       # profiles.id (UUID)
+    user_id: str,
     challenge: dict,
     token_address: str,
     token_symbol: str,
@@ -143,34 +138,18 @@ async def execute_buy(
     auto_sell_pct: float | None,
 ) -> dict:
     """
-    Simulate a buy:
-      1. Validate position limits
-      2. Create position record
-      3. Record buy trade
-      4. Update challenge aggregate stats (Q3)
-    Returns a result dict.
+    Simulate a buy. Returns {"ok": True, ...} or {"ok": False, "error": ...}.
+    Updates challenge stats (Q3) after every successful buy.
     """
-    challenge_id = challenge["id"]
-
-    # Check open position count
+    challenge_id   = challenge["id"]
     open_positions = await db.get_open_positions(user_id)
+
     if len(open_positions) >= TRADING.max_open_positions:
-        return {
-            "ok": False,
-            "error": f"Max {TRADING.max_open_positions} open positions reached.",
-        }
+        return {"ok": False, "error": f"Max {TRADING.max_open_positions} open positions reached."}
 
-    # Check already in this token
-    already_in = any(
-        p["token_address"] == token_address for p in open_positions
-    )
-    if already_in:
-        return {
-            "ok": False,
-            "error": "You already have an open position in this token.",
-        }
+    if any(p["token_address"] == token_address for p in open_positions):
+        return {"ok": False, "error": "You already have an open position in this token."}
 
-    # Create position
     position = await db.create_position(
         user_id=user_id,
         challenge_id=challenge_id,
@@ -186,7 +165,6 @@ async def execute_buy(
         auto_sell_pct=auto_sell_pct,
     )
 
-    # Record buy trade
     await db.record_trade(
         user_id=user_id,
         challenge_id=challenge_id,
@@ -205,7 +183,6 @@ async def execute_buy(
         trigger="manual",
     )
 
-    # Update challenge stats (Q3)
     await db.update_challenge_stats(user_id, challenge_id)
 
     return {
@@ -229,15 +206,11 @@ async def execute_sell(
     trigger: str = "manual",
 ) -> dict:
     """
-    Simulate a sell:
-      1. Close (or partially close) the position
-      2. Record sell trade
-      3. Update challenge aggregate stats (Q3)
-    Returns the close result dict (contains pnl_sol, pnl_pct, etc.).
+    Simulate a sell. Records the trade and updates challenge stats (Q3).
+    Returns the close result dict (pnl_sol, pnl_pct, etc.).
     """
     result = await db.close_position(position_id, exit_price_sol, sell_pct)
 
-    # Record sell trade
     await db.record_trade(
         user_id=result["user_id"],
         challenge_id=result["challenge_id"],
@@ -256,9 +229,7 @@ async def execute_sell(
         trigger=trigger,
     )
 
-    # Update challenge stats (Q3)
     await db.update_challenge_stats(result["user_id"], result["challenge_id"])
-
     return result
 
 
@@ -266,29 +237,16 @@ async def execute_sell(
 # Background position monitor
 # ---------------------------------------------------------------------------
 
-async def monitor_positions(app) -> None:
+async def check_all_positions(app) -> None:
     """
-    Periodic background task: check every open position for SL/TP/trailing stop.
-    Runs every TRADING.monitor_interval_seconds seconds.
-    Sends Telegram notifications for auto-closes.
+    Check every open position against SL / TP / trailing / auto-sell thresholds.
+    Called by the PTB job_queue every TRADING.monitor_interval_seconds seconds.
+    Using job_queue (not asyncio.create_task) ensures proper lifecycle management.
     """
-    while True:
-        try:
-            await _check_all_positions(app)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.error("monitor_positions error: %s", e, exc_info=True)
-        await asyncio.sleep(TRADING.monitor_interval_seconds)
-
-
-async def _check_all_positions(app) -> None:
     positions = await db.get_all_open_positions()
     if not positions:
         return
 
-    # Fetch profiles for telegram notification
-    # profiles.id (UUID) = positions.user_id
     user_ids = list({p["user_id"] for p in positions})
     client   = await db.get_client()
     prof_res = await (
@@ -297,13 +255,11 @@ async def _check_all_positions(app) -> None:
         .in_("id", user_ids)
         .execute()
     )
-    # Map profiles.id → profile row
     profile_map: dict[str, dict] = {
         p["id"]: p for p in (prof_res.data or [])
     }
 
-    # Fetch current SOL/USD price once for the whole batch
-    from database import _fetch_sol_price  # avoid circular at module level
+    from database import _fetch_sol_price
     sol_price = await _fetch_sol_price()
     if sol_price <= 0:
         return
@@ -321,7 +277,6 @@ async def _check_position(
     profile_map: dict[str, dict],
     app,
 ) -> None:
-    """Check a single position against SL/TP/trailing/auto-sell thresholds."""
     pair = await get_token_price(position["token_address"])
     if pair is None:
         return
@@ -330,28 +285,25 @@ async def _check_position(
     if current_price <= 0:
         return
 
-    # Update high-water mark for trailing stop
     await db.update_position_high(position["id"], current_price)
 
-    entry_price     = float(position["entry_price_sol"])
-    highest_price   = float(position.get("highest_price_sol") or entry_price)
-    sl_pct          = position.get("stop_loss_pct")
-    tp_pct          = position.get("take_profit_pct")
-    trailing_pct    = position.get("trailing_stop_pct")
-    auto_sell_pct   = position.get("auto_sell_pct")
+    entry_price   = float(position["entry_price_sol"])
+    highest_price = float(position.get("highest_price_sol") or entry_price)
+    sl_pct        = position.get("stop_loss_pct")
+    tp_pct        = position.get("take_profit_pct")
+    trailing_pct  = position.get("trailing_stop_pct")
+    auto_sell_pct = position.get("auto_sell_pct")
 
-    pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
-
-    trigger: str | None = None
-    sell_pct = 100.0
+    pnl_pct  = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+    trigger  : str | None = None
+    sell_pct : float      = 100.0
 
     if sl_pct and pnl_pct <= -float(sl_pct):
         trigger = "stop_loss"
     elif tp_pct and pnl_pct >= float(tp_pct):
         trigger = "take_profit"
     elif trailing_pct and highest_price > 0:
-        trail_from_high = (current_price - highest_price) / highest_price * 100
-        if trail_from_high <= -float(trailing_pct):
+        if (current_price - highest_price) / highest_price * 100 <= -float(trailing_pct):
             trigger = "trailing_stop"
     elif auto_sell_pct and pnl_pct >= float(auto_sell_pct):
         trigger  = "auto_sell"
@@ -360,7 +312,6 @@ async def _check_position(
     if trigger is None:
         return
 
-    # Auto-close the position
     result = await execute_sell(
         position_id=position["id"],
         exit_price_sol=current_price,
@@ -368,7 +319,6 @@ async def _check_position(
         trigger=trigger,
     )
 
-    # Notify the user via Telegram
     profile = profile_map.get(position["user_id"])
     if profile:
         tg_id_raw = profile.get("telegram_id")
@@ -376,19 +326,17 @@ async def _check_position(
             try:
                 tg_id   = int(tg_id_raw)
                 pnl     = result["pnl_sol"]
-                pnl_pct = result["pnl_pct"]
-                emoji   = "🟢" if pnl >= 0 else "🔴"
                 sign    = "+" if pnl >= 0 else ""
+                emoji   = "🟢" if pnl >= 0 else "🔴"
                 label   = trigger.replace("_", " ").title()
-                text = (
-                    f"{emoji} *{label} Triggered*\n\n"
-                    f"Token: `{result['token_symbol']}`\n"
-                    f"PnL: `{sign}{pnl:.4f} SOL ({sign}{pnl_pct:.2f}%)`\n"
-                    f"Sold: `{sell_pct:.0f}%` of position"
-                )
                 await app.bot.send_message(
                     chat_id=tg_id,
-                    text=text,
+                    text=(
+                        f"{emoji} *{label} Triggered*\n\n"
+                        f"Token: `{result['token_symbol']}`\n"
+                        f"PnL: `{sign}{pnl:.4f} SOL ({sign}{result['pnl_pct']:.2f}%)`\n"
+                        f"Sold: `{sell_pct:.0f}%` of position"
+                    ),
                     parse_mode="Markdown",
                 )
             except Exception as e:
