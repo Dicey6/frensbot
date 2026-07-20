@@ -1,0 +1,6 @@
+# FundedFrens Telegram Trading Bot — Python dependencies
+python-telegram-bot[job-queue]==21.3
+supabase==2.9.1
+httpx==0.27.2
+matplotlib==3.9.2
+python-dotenv==1.0.1

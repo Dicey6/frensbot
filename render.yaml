@@ -1,0 +1,27 @@
+# Render deployment configuration for the FundedFrens Telegram Bot.
+# Deploy as a Background Worker — bots don't serve HTTP.
+# https://render.com/docs/yaml-spec
+
+services:
+  - type: worker
+    name: fundedfrens-telegram-bot
+    runtime: python
+    region: oregon          # choose the region closest to your Supabase instance
+    plan: starter           # upgrade to standard for production
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false         # set manually in Render dashboard
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: APP_URL
+        value: https://fundedfrens.com
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHON_VERSION
+        value: "3.11.9"
