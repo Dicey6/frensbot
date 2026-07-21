@@ -1209,6 +1209,23 @@ def main() -> None:
         first=10,
     )
 
+    # ── Health server for Render Web Service port binding ──────────────────
+    import threading, os
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *args): pass
+
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), _H).serve_forever(),
+        daemon=True,
+    ).start()
+    # ── End health server ───────────────────────────────────────────────────
+
     log.info("Bot polling started.")
     app.run_polling(drop_pending_updates=True)
 
