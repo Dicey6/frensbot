@@ -1,0 +1,164 @@
+FundedFrens Telegram Bot — Full Repository & Supabase Audit
+
+Repository:
+
+https://github.com/Dicey6/frensbot
+
+This is a new session.
+
+Start by cloning the repository and do not make any code changes yet.
+
+Your first objective is to fully understand the project before implementing or refactoring anything.
+
+⸻
+
+Phase 1 — Repository Analysis
+
+Perform a complete audit of the entire codebase.
+
+Understand:
+
+* Overall project architecture
+* Folder structure
+* Entry points
+* Bot workflow
+* Conversation handlers
+* Trading flow
+* Background jobs
+* Deployment configuration
+* Environment variables
+* External integrations
+* Current dependencies
+
+I want a complete understanding of how the bot works internally.
+
+⸻
+
+Phase 2 — Supabase Integration Audit
+
+This is the most important part of the audit.
+
+Map every interaction between the bot and Supabase.
+
+Identify exactly what the bot can currently read from the database.
+
+Examples include (but are not limited to):
+
+* Profiles
+* Challenges
+* Challenge plans
+* Challenge status
+* Challenge capital
+* Buying power
+* Open positions
+* Trades
+* Portfolio
+* Bot settings
+* Notifications
+* Analytics data
+* Referral data
+* Wallet information
+* Any other tables or views
+
+Then identify everything the bot can currently write or update.
+
+Examples include:
+
+* Trades
+* Positions
+* Challenge progress
+* Win rate
+* Drawdown
+* Trading days
+* Portfolio data
+* Notifications
+* Bot settings
+* Analytics
+* Referral information
+* Any other database records
+
+I want a complete picture of the bot’s permissions and capabilities inside Supabase.
+
+⸻
+
+Phase 3 — Trading System Audit
+
+Document the entire trading lifecycle.
+
+Include:
+
+* Contract detection
+* Token lookup
+* Market data retrieval
+* Buy flow
+* Sell flow
+* Position creation
+* Position updates
+* Background monitoring
+* Stop Loss
+* Take Profit
+* Trailing Stop
+* Auto Sell
+* Portfolio updates
+* PnL generation
+* Challenge updates
+
+Show where each part is implemented within the codebase.
+
+⸻
+
+Phase 4 — Error & Stability Audit
+
+Scan the repository for:
+
+* Runtime errors
+* Broken imports
+* Duplicate logic
+* Dead code
+* Unused files
+* Performance issues
+* Race conditions
+* Deployment issues
+* API failures
+* Technical debt
+* Anything that could affect production stability
+
+⸻
+
+Phase 5 — Current Limitations
+
+Identify everything the bot currently cannot do.
+
+Examples:
+
+* Missing trading functionality
+* Missing challenge enforcement
+* Missing analytics
+* Missing Supabase integration
+* UI limitations
+* Performance bottlenecks
+* Scalability concerns
+* Reliability issues
+
+⸻
+
+Deliverables
+
+Do not implement fixes during this phase.
+
+Instead, return a detailed report covering:
+
+1. Overall architecture
+2. Repository structure
+3. Complete Supabase integration map
+4. Everything the bot can read from Supabase
+5. Everything the bot can write to Supabase
+6. Complete trading flow
+7. Background jobs
+8. API integrations
+9. Current bugs
+10. Technical debt
+11. Current limitations
+12. Recommendations, ordered by priority
+
+The objective of this audit is to fully understand the bot’s capabilities, limitations, and backend integration before making any architectural or feature changes.
