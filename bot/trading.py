@@ -109,6 +109,32 @@ async def get_token_price(token_address: str) -> dict | None:
     return pool[0]
 
 
+async def get_pair_by_pair_address(pair_address: str) -> dict | None:
+    """
+    Look up a DexScreener pair by its pool/pair address (not token address).
+    Used as a fallback when the pasted address is a liquidity pool address
+    (common with migrated pump.fun tokens on DexScreener URLs).
+    Returns the best Solana pair, or None if not found.
+    """
+    url = f"{TRADING.dexscreener_base}/pairs/solana/{pair_address}"
+    try:
+        r = await _client().get(url)
+        r.raise_for_status()
+        data = r.json()
+        # Response can be {"pair": {...}} or {"pairs": [...]}
+        pair = data.get("pair")
+        if pair and pair.get("chainId") == "solana":
+            return pair
+        pairs = data.get("pairs") or []
+        solana = [p for p in pairs if p.get("chainId") == "solana"]
+        if solana:
+            solana.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+            return solana[0]
+    except Exception as e:
+        log.debug("DexScreener pairs lookup failed for %s: %s", pair_address, e)
+    return None
+
+
 def price_in_sol(pair: dict, sol_price_usd: float) -> float:
     """Convert a DexScreener pair's priceUsd to SOL-denominated price."""
     price_usd_raw = pair.get("priceUsd") or pair.get("priceNative")
@@ -286,6 +312,11 @@ async def get_full_token_info(address: str) -> dict | None:
     returns name, symbol, logo, mint authority, and price.  DexScreener enriches
     with real-time market data (volume, liquidity, price changes).
 
+    For migrated tokens, the pasted address might be a liquidity pool address
+    rather than a token address (common with DexScreener URLs for migrated
+    pump.fun tokens).  In that case, we fall back to the /pairs/solana endpoint
+    to resolve the actual token address and retry.
+
     Order of priority:
       1. Helius getAsset  — identity (name/symbol/logo/renounced) + Helius price
       2. DexScreener      — market data (price preferred, volume, liq, changes)
@@ -297,6 +328,32 @@ async def get_full_token_info(address: str) -> dict | None:
         _safe(get_token_price(address),        timeout=8.0),
         _safe(get_pump_bonding_curve(address), timeout=4.0),
     )
+
+    # ── Migrated token fallback ──────────────────────────────────────────────
+    # If DexScreener returned nothing by token address, the pasted address might
+    # be a pair/pool address (e.g. from a DexScreener URL for a migrated token).
+    # Try the /pairs/solana endpoint to get the actual base token address.
+    resolved_address = address
+    if not dex_pair:
+        pair_lookup = await _safe(get_pair_by_pair_address(address), timeout=6.0)
+        if pair_lookup:
+            base = pair_lookup.get("baseToken") or {}
+            token_addr = base.get("address")
+            if token_addr and token_addr != address:
+                log.info(
+                    "Resolved pair address %s → token address %s",
+                    address, token_addr,
+                )
+                resolved_address = token_addr
+                dex_pair = pair_lookup
+                # Re-fetch Helius for the real token address if we didn't get it
+                if not helius_asset:
+                    helius_asset = await _safe(get_helius_asset(token_addr), timeout=6.0)
+                # Re-fetch bonding curve for real token address
+                if curve_pct is None:
+                    curve_pct = await _safe(get_pump_bonding_curve(token_addr), timeout=4.0)
+            else:
+                dex_pair = pair_lookup
 
     # Parse Helius result
     name = symbol = logo = None
@@ -331,7 +388,7 @@ async def get_full_token_info(address: str) -> dict | None:
         # Prefer DEX price (real-time), fall back to Helius price
         price_usd = float(dex_pair.get("priceUsd") or 0) or helius_price
         return {
-            "address":       address,
+            "address":       resolved_address,
             "symbol":        symbol or "???",
             "name":          name or "Unknown",
             "logo_url":      logo,
@@ -351,7 +408,7 @@ async def get_full_token_info(address: str) -> dict | None:
     else:
         # Helius found it but it's not on any DEX yet (pre-migration)
         return {
-            "address":       address,
+            "address":       resolved_address,
             "symbol":        symbol or "???",
             "name":          name or "Unknown",
             "logo_url":      logo,
@@ -431,6 +488,7 @@ async def execute_buy(
 
     entry_time = datetime.now(timezone.utc).isoformat()
 
+    # ── Create position (this is the critical write — must succeed)
     position = await db.create_position(
         user_id=user_id,
         challenge_id=challenge_id,
@@ -446,32 +504,41 @@ async def execute_buy(
         trailing_stop_pct=trailing_stop_pct,
     )
 
-    await db.record_trade(
-        user_id=user_id,
-        challenge_id=challenge_id,
-        position_id=position["id"],
-        token_address=token_address,
-        token_symbol=token_symbol,
-        token_name=token_name,
-        side="buy",
-        amount_sol=amount_sol,
-        entry_price_sol=entry_price_sol,
-        exit_price_sol=None,
-        market_cap_usd=entry_market_cap_usd,
-        pnl_sol=None,
-        pnl_pct=None,
-        sell_pct=None,
-        trigger="manual",
-        liquidity_usd=liquidity_usd,
-        volume_24h_usd=volume_24h_usd,
-        price_impact_pct=price_impact_pct,
-        entry_time=entry_time,
-        stop_loss_pct=stop_loss_pct,
-        take_profit_pct=take_profit_pct,
-        trailing_stop_pct=trailing_stop_pct,
-    )
+    # ── Record trade and update stats — log failures but don't propagate them.
+    # The position is already created in the DB; raising an exception here would
+    # cause the bot to show an error while the position is visible in /positions.
+    try:
+        await db.record_trade(
+            user_id=user_id,
+            challenge_id=challenge_id,
+            position_id=position["id"],
+            token_address=token_address,
+            token_symbol=token_symbol,
+            token_name=token_name,
+            side="buy",
+            amount_sol=amount_sol,
+            entry_price_sol=entry_price_sol,
+            exit_price_sol=None,
+            market_cap_usd=entry_market_cap_usd,
+            pnl_sol=None,
+            pnl_pct=None,
+            sell_pct=None,
+            trigger="manual",
+            liquidity_usd=liquidity_usd,
+            volume_24h_usd=volume_24h_usd,
+            price_impact_pct=price_impact_pct,
+            entry_time=entry_time,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
+        )
+    except Exception as e:
+        log.error("record_trade (buy) failed for position %s: %s", position["id"], e)
 
-    await db.update_challenge_stats(user_id, challenge_id)
+    try:
+        await db.update_challenge_stats(user_id, challenge_id)
+    except Exception as e:
+        log.error("update_challenge_stats (buy) failed: %s", e)
 
     return {
         "ok":           True,
@@ -498,37 +565,49 @@ async def execute_sell(
     price_impact_pct: float | None = None,
 ) -> dict:
     exit_time = datetime.now(timezone.utc).isoformat()
-    result    = await db.close_position(position_id, exit_price_sol, sell_pct)
 
-    await db.record_trade(
-        user_id=result["user_id"],
-        challenge_id=result["challenge_id"],
-        position_id=position_id,
-        token_address=result["token_address"],
-        token_symbol=result["token_symbol"],
-        token_name=result.get("token_name"),
-        side="sell",
-        amount_sol=result["received_sol"],
-        entry_price_sol=result["entry_price"],
-        exit_price_sol=result["exit_price"],
-        market_cap_usd=exit_market_cap_usd,
-        pnl_sol=result["pnl_sol"],
-        pnl_pct=result["pnl_pct"],
-        sell_pct=sell_pct,
-        trigger=trigger,
-        exit_market_cap_usd=exit_market_cap_usd,
-        liquidity_usd=liquidity_usd,
-        volume_24h_usd=volume_24h_usd,
-        price_impact_pct=price_impact_pct,
-        hold_time_seconds=result.get("hold_time_seconds"),
-        entry_time=result.get("opened_at"),
-        exit_time=exit_time,
-        stop_loss_pct=_to_float(result.get("stop_loss_pct")),
-        take_profit_pct=_to_float(result.get("take_profit_pct")),
-        trailing_stop_pct=_to_float(result.get("trailing_stop_pct")),
-    )
+    # ── Close the position (critical write — propagate failures normally)
+    result = await db.close_position(position_id, exit_price_sol, sell_pct)
 
-    await db.update_challenge_stats(result["user_id"], result["challenge_id"])
+    # ── Record trade and update stats — log failures but don't propagate.
+    # The position is already closed; raising here makes the bot show an error
+    # even though the sell went through successfully.
+    try:
+        await db.record_trade(
+            user_id=result["user_id"],
+            challenge_id=result["challenge_id"],
+            position_id=position_id,
+            token_address=result["token_address"],
+            token_symbol=result["token_symbol"],
+            token_name=result.get("token_name"),
+            side="sell",
+            amount_sol=result["received_sol"],
+            entry_price_sol=result["entry_price"],
+            exit_price_sol=result["exit_price"],
+            market_cap_usd=exit_market_cap_usd,
+            pnl_sol=result["pnl_sol"],
+            pnl_pct=result["pnl_pct"],
+            sell_pct=sell_pct,
+            trigger=trigger,
+            exit_market_cap_usd=exit_market_cap_usd,
+            liquidity_usd=liquidity_usd,
+            volume_24h_usd=volume_24h_usd,
+            price_impact_pct=price_impact_pct,
+            hold_time_seconds=result.get("hold_time_seconds"),
+            entry_time=result.get("opened_at"),
+            exit_time=exit_time,
+            stop_loss_pct=_to_float(result.get("stop_loss_pct")),
+            take_profit_pct=_to_float(result.get("take_profit_pct")),
+            trailing_stop_pct=_to_float(result.get("trailing_stop_pct")),
+        )
+    except Exception as e:
+        log.error("record_trade (sell) failed for position %s: %s", position_id, e)
+
+    try:
+        await db.update_challenge_stats(result["user_id"], result["challenge_id"])
+    except Exception as e:
+        log.error("update_challenge_stats (sell) failed: %s", e)
+
     return result
 
 

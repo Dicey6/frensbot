@@ -139,6 +139,13 @@ async def link_telegram(
 # Challenges
 # ---------------------------------------------------------------------------
 
+# In-memory cache: challenge_id -> start_balance_sol
+# Prevents start_balance from drifting with SOL price across calls in the
+# same bot session.  The cache is intentionally not persisted across restarts —
+# on a restart the price is re-fetched once and then locked again.
+_start_balance_cache: dict[str, float] = {}
+
+
 async def get_active_challenge(user_id: str) -> dict | None:
     db = await get_client()
     res = await (
@@ -161,20 +168,30 @@ async def get_active_challenge(user_id: str) -> dict | None:
 
 async def _initialize_challenge_balance(challenge: dict) -> dict:
     """
-    Compute start_balance_sol for this session and return an enriched challenge
-    dict.  We do NOT write back to the DB because the challenges table has no
+    Compute start_balance_sol for this challenge and return an enriched
+    challenge dict.  The value is cached in _start_balance_cache by
+    challenge_id so the same figure is used for the whole bot session,
+    even if SOL price moves.
+
+    We do NOT write back to the DB because the challenges table has no
     start_balance_sol column — the value is derived at runtime from the plan.
     """
-    db = await get_client()
-    plan_name = (challenge.get("challenge_plan") or "starter").lower()
-    plan_usd  = PLAN_USD.get(plan_name, 350.0)
+    ch_id = challenge["id"]
+
+    # Return cached value if already computed this session
+    if ch_id in _start_balance_cache:
+        return {**challenge, "start_balance_sol": _start_balance_cache[ch_id]}
+
+    db_client = await get_client()
+    plan_name  = (challenge.get("challenge_plan") or "starter").lower()
+    plan_usd   = PLAN_USD.get(plan_name, 350.0)
     sol_price: float | None = None
 
     order_id = challenge.get("order_id")
     if order_id:
         try:
             ord_res = await (
-                db.table("orders")
+                db_client.table("orders")
                 .select("sol_price_usd")
                 .eq("id", order_id)
                 .limit(1)
@@ -190,9 +207,10 @@ async def _initialize_challenge_balance(challenge: dict) -> dict:
         sol_price = await fetch_sol_price()
 
     start_balance_sol = round(plan_usd / sol_price, 9)
+    _start_balance_cache[ch_id] = start_balance_sol
     log.info(
-        "Computed start_balance_sol=%.4f SOL for challenge %s (plan=%s @$%.2f)",
-        start_balance_sol, challenge["id"], plan_name, sol_price,
+        "Computed+cached start_balance_sol=%.4f SOL for challenge %s (plan=%s @$%.2f)",
+        start_balance_sol, ch_id, plan_name, sol_price,
     )
     return {**challenge, "start_balance_sol": start_balance_sol}
 
@@ -209,10 +227,15 @@ async def get_account_summary(user_id: str, challenge: dict) -> dict:
     start_balance = float(challenge.get("start_balance_sol") or 0)
 
     if start_balance <= 0:
-        plan_name = (challenge.get("challenge_plan") or "starter").lower()
-        plan_usd  = PLAN_USD.get(plan_name, 350.0)
-        sol_price = await fetch_sol_price()
-        start_balance = plan_usd / sol_price if sol_price > 0 else 0.0
+        ch_id     = challenge["id"]
+        if ch_id in _start_balance_cache:
+            start_balance = _start_balance_cache[ch_id]
+        else:
+            plan_name = (challenge.get("challenge_plan") or "starter").lower()
+            plan_usd  = PLAN_USD.get(plan_name, 350.0)
+            sol_price = await fetch_sol_price()
+            start_balance = plan_usd / sol_price if sol_price > 0 else 0.0
+            _start_balance_cache[ch_id] = start_balance
 
     db    = await get_client()
     ch_id = challenge["id"]
@@ -593,19 +616,23 @@ async def update_challenge_stats(user_id: str, challenge_id: str) -> None:
         if t.get("created_at")
     })
 
-    ch_res = await (
-        db.table("challenges")
-        .select("start_balance_sol, challenge_plan")
-        .eq("id", challenge_id)
-        .single()
-        .execute()
-    )
-    ch_data   = ch_res.data or {}
-    start_bal = float(ch_data.get("start_balance_sol") or 0)
+    # Use cached start_balance so stats don't drift with SOL price
+    start_bal = _start_balance_cache.get(challenge_id, 0.0)
     if start_bal <= 0:
-        plan_name = (ch_data.get("challenge_plan") or "starter").lower()
-        sol_price = await fetch_sol_price()
-        start_bal = PLAN_USD.get(plan_name, 350.0) / sol_price if sol_price > 0 else 0.0
+        ch_res = await (
+            db.table("challenges")
+            .select("start_balance_sol, challenge_plan")
+            .eq("id", challenge_id)
+            .single()
+            .execute()
+        )
+        ch_data   = ch_res.data or {}
+        start_bal = float(ch_data.get("start_balance_sol") or 0)
+        if start_bal <= 0:
+            plan_name = (ch_data.get("challenge_plan") or "starter").lower()
+            sol_price = await fetch_sol_price()
+            start_bal = PLAN_USD.get(plan_name, 350.0) / sol_price if sol_price > 0 else 0.0
+        _start_balance_cache[challenge_id] = start_bal
 
     challenge_progress = round(max(0.0, realized_pnl / start_bal * 100) if start_bal else 0.0, 2)
     drawdown           = round(max(0.0, -realized_pnl / start_bal * 100) if start_bal else 0.0, 2)

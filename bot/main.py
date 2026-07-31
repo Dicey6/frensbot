@@ -5,6 +5,7 @@ Commands: /start /home /positions /portfolio /challenge /settings /help /pnl
 
 Design:
   - Messages always sent fresh — history is never edited or deleted.
+  - Refresh actions EDIT the current message in-place rather than sending new.
   - No confirmation steps on buy or sell — tap to execute instantly.
   - No auto-sell — only manual sells, stop-loss, and trailing stop.
   - Website username (profiles.username) is used everywhere.
@@ -93,7 +94,7 @@ def _back(to: str = "home", label: str = "← Back") -> list[InlineKeyboardButto
 
 
 # ---------------------------------------------------------------------------
-# Display — always sends a new message
+# Display helpers
 # ---------------------------------------------------------------------------
 
 
@@ -103,6 +104,39 @@ async def _show(
     text: str,
     keyboard: InlineKeyboardMarkup | None = None,
 ) -> None:
+    """Always sends a new message."""
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+async def _edit_or_show(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    """
+    Edits the current message in-place when called from a callback query
+    (refresh actions), otherwise sends a new message.
+    Falls back to send_message if the edit fails for any reason.
+    """
+    q = update.callback_query
+    if q and q.message:
+        try:
+            await q.edit_message_text(
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            log.debug("edit_message_text failed, falling back to send: %s", e)
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
@@ -337,10 +371,13 @@ async def _show_token_page(
     address: str,
     profile: dict,
     challenge: dict,
+    *,
+    use_edit: bool = False,
 ) -> None:
     token = await trading.get_full_token_info(address)
     if not token:
-        await _show(
+        msg_fn = _edit_or_show if use_edit else _show
+        await msg_fn(
             update, context,
             "❌ *Token not found.*\n\nCheck the address or try a different one.",
             InlineKeyboardMarkup([_back()]),
@@ -357,10 +394,12 @@ async def _show_token_page(
     qb2 = float(settings.get("quick_buy_2") or TRADING.quick_buy_2)
     qb3 = float(settings.get("quick_buy_3") or TRADING.quick_buy_3)
 
-    short        = f"{address[:6]}...{address[-4:]}"
-    chart_url    = token.get("dex_url") or f"https://dexscreener.com/solana/{address}"
-    explorer_url = f"https://solscan.io/token/{address}"
-    scan_url     = f"https://rugcheck.xyz/tokens/{address}"
+    # Use the resolved address from token info (handles pair-address lookups)
+    resolved_addr = token.get("address") or address
+    short        = f"{resolved_addr[:6]}...{resolved_addr[-4:]}"
+    chart_url    = token.get("dex_url") or f"https://dexscreener.com/solana/{resolved_addr}"
+    explorer_url = f"https://solscan.io/token/{resolved_addr}"
+    scan_url     = f"https://rugcheck.xyz/tokens/{resolved_addr}"
     plan         = (challenge.get("challenge_plan") or "Starter").title()
     open_pos     = int(challenge.get("open_positions") or 0)
     drawdown     = float(challenge.get("drawdown") or summary["drawdown_pct"])
@@ -403,7 +442,8 @@ async def _show_token_page(
         f"*Drawdown:* `{drawdown:.2f}%`"
     )
 
-    await _show(
+    msg_fn = _edit_or_show if use_edit else _show
+    await msg_fn(
         update, context, text,
         InlineKeyboardMarkup([
             [
@@ -531,7 +571,13 @@ async def _show_sort_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------------------------------------------------------------------------
 
 
-async def _show_position_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, position_id: int) -> None:
+async def _show_position_screen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    position_id: int,
+    *,
+    use_edit: bool = False,
+) -> None:
     position = await db.get_position(position_id)
     if not position:
         await _show(update, context, "❌ Position not found.", InlineKeyboardMarkup([_back("positions")]))
@@ -542,16 +588,11 @@ async def _show_position_screen(update: Update, context: ContextTypes.DEFAULT_TY
         await _show_not_linked(update, context)
         return
 
-    settings = await db.get_bot_settings(profile["id"])
-    qs1 = float(settings.get("quick_sell_1") or TRADING.quick_sell_1)
-    qs2 = float(settings.get("quick_sell_2") or TRADING.quick_sell_2)
-    qs3 = float(settings.get("quick_sell_3") or TRADING.quick_sell_3)
-
-    context.user_data["current_position_id"] = position_id
-    context.user_data["profile"]             = profile
+    address   = position["token_address"]
+    is_closed = (position.get("status") or "open") == "closed"
 
     sol_price = await db.fetch_sol_price()
-    pair      = await trading.get_token_price(position["token_address"])
+    pair      = await trading.get_token_price(address)
     current   = trading.price_in_sol(pair, sol_price) if pair else float(position["entry_price_sol"])
     entry     = float(position["entry_price_sol"])
     inv       = float(position["amount_sol_invested"])
@@ -560,29 +601,57 @@ async def _show_position_screen(update: Update, context: ContextTypes.DEFAULT_TY
     cur_val   = inv + pnl_sol
     sign      = "+" if pnl_sol >= 0 else ""
     emoji     = _pnl_emoji(pnl_sol)
+    pnl_usd   = pnl_sol * sol_price
 
-    mc  = float((pair.get("marketCap") or pair.get("fdv") or 0)) if pair else 0
-    liq = float(((pair.get("liquidity") or {}).get("usd") or 0)) if pair else 0
-    vol = float(((pair.get("volume") or {}).get("h24") or 0)) if pair else 0
-    chart_url = (pair.get("url") if pair else None) or f"https://dexscreener.com/solana/{position['token_address']}"
-    address   = position["token_address"]
+    # Market cap values (shown instead of raw price)
+    entry_mc   = float(position.get("entry_market_cap_usd") or 0)
+    current_mc = float((pair.get("marketCap") or pair.get("fdv") or 0)) if pair else 0
+    liq        = float(((pair.get("liquidity") or {}).get("usd") or 0)) if pair else 0
+    vol        = float(((pair.get("volume") or {}).get("h24") or 0)) if pair else 0
+    chart_url  = (pair.get("url") if pair else None) or f"https://dexscreener.com/solana/{address}"
 
-    await _show(
-        update, context,
-        f"*{position['token_symbol']}*  {emoji}\n"
-        f"`{address[:6]}...{address[-4:]}`\n"
+    # Full CA is always shown, ready to copy
+    text = (
+        f"*{position['token_symbol']}*  {emoji}"
+        + (" `[CLOSED]`" if is_closed else "") + "\n"
+        f"`{address}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Entry:* `{_fmt_price(entry * sol_price)}`  →  *Now:* `{_fmt_price(current * sol_price)}`\n"
+        f"*Entry MC:* `{_fmt_mc(entry_mc) if entry_mc > 0 else '—'}`  →  "
+        f"*Now MC:* `{_fmt_mc(current_mc) if current_mc > 0 else '—'}`\n"
         f"*Invested:* `{_fmt_sol(inv)}`  |  *Value:* `{_fmt_sol(cur_val)}`\n"
-        f"*PnL:* {emoji} `{sign}{_fmt_sol(pnl_sol)}` (`{sign}{pnl_pct:.2f}%`)\n"
+        f"*PnL:* {emoji} `{sign}{_fmt_sol(pnl_sol)}` (`{sign}{pnl_pct:.2f}%`)  "
+        f"`{sign}{_fmt_price(pnl_usd)}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*MC:* `{_fmt_mc(mc)}`  |  *Liq:* `{_fmt_mc(liq)}`  |  *Vol:* `{_fmt_mc(vol)}`\n"
+        f"*MC:* `{_fmt_mc(current_mc)}`  |  *Liq:* `{_fmt_mc(liq)}`  |  *Vol:* `{_fmt_mc(vol)}`\n"
         f"*Open:* `{_time_ago(position.get('opened_at', ''))}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"SL: `{_risk_str(position.get('stop_loss_pct'))}`  "
         f"TP: `{_risk_str(position.get('take_profit_pct'))}`  "
-        f"Trail: `{_risk_str(position.get('trailing_stop_pct'))}`",
-        InlineKeyboardMarkup([
+        f"Trail: `{_risk_str(position.get('trailing_stop_pct'))}`"
+    )
+
+    if is_closed:
+        # Position fully sold — no sell buttons
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎴 PnL Card", callback_data=f"pos_pnl_{position_id}"),
+            ],
+            [
+                InlineKeyboardButton("📈 Chart",    url=chart_url),
+                InlineKeyboardButton("🔍 Explorer", url=f"https://solscan.io/token/{address}"),
+            ],
+            _back("positions"),
+        ])
+    else:
+        settings = await db.get_bot_settings(profile["id"])
+        qs1 = float(settings.get("quick_sell_1") or TRADING.quick_sell_1)
+        qs2 = float(settings.get("quick_sell_2") or TRADING.quick_sell_2)
+        qs3 = float(settings.get("quick_sell_3") or TRADING.quick_sell_3)
+
+        context.user_data["current_position_id"] = position_id
+        context.user_data["profile"]             = profile
+
+        keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(f"Sell {qs1:.0f}%", callback_data="pos_sell_q1"),
                 InlineKeyboardButton(f"Sell {qs2:.0f}%", callback_data="pos_sell_q2"),
@@ -600,8 +669,10 @@ async def _show_position_screen(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton("🔍 Explorer", url=f"https://solscan.io/token/{address}"),
             ],
             _back("positions"),
-        ]),
-    )
+        ])
+
+    msg_fn = _edit_or_show if use_edit else _show
+    await msg_fn(update, context, text, keyboard)
 
 
 # ---------------------------------------------------------------------------
@@ -646,10 +717,15 @@ async def _send_position_pnl_card(update: Update, context: ContextTypes.DEFAULT_
     )
 
     sign = "+" if pnl_sol >= 0 else ""
+    pnl_usd = pnl_sol * sol_price
     await context.bot.send_photo(
         chat_id=update.effective_chat.id,
         photo=img,
-        caption=f"🎴 *{position['token_symbol']}*  {sign}{pnl_sol:.4f} SOL  ({sign}{pnl_pct:.2f}%)",
+        caption=(
+            f"🎴 *{position['token_symbol']}*  "
+            f"{sign}{pnl_sol:.4f} SOL  ({sign}{pnl_pct:.2f}%)  "
+            f"{sign}{_fmt_price(pnl_usd)}"
+        ),
         parse_mode="Markdown",
     )
 
@@ -913,19 +989,38 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*Trading*\n"
         "Paste any CA, ticker, or link → token loads instantly.\n"
-        "Tap a buy button → executes immediately.\n\n"
+        "Tap a buy button → executes immediately, no confirmation.\n"
+        "The bot accepts ALL contract addresses — including migrated\n"
+        "pump.fun tokens. If you paste a DexScreener link the CA is\n"
+        "resolved automatically.\n\n"
         "*Selling*\n"
         "📊 Positions → tap a position → tap a sell button.\n"
-        "Quick-sell percentages are configurable in ⚙️ Settings.\n\n"
+        "Quick-sell percentages are configurable in ⚙️ Settings.\n"
+        "After every sell a PnL card is sent automatically showing\n"
+        "your profit/loss in SOL and USD.\n\n"
+        "*Position View*\n"
+        "Entry and current price are shown as *Market Cap* so you can\n"
+        "see exactly where the token was and is now.\n"
+        "PnL is shown in both SOL and USD.\n"
+        "The full contract address is always visible and ready to copy.\n"
+        "Once a position is 100% sold, sell buttons are removed.\n"
+        "Tap 🔄 Refresh to update prices in-place.\n\n"
+        "*Balance*\n"
+        "Your start balance is locked at challenge activation and stays\n"
+        "fixed — it does not change with SOL price movements.\n"
+        "Buying power = start balance + realized PnL − open positions.\n\n"
         "*Risk Management*\n"
-        "Configure Stop Loss and Trailing Stop in ⚙️ Settings.\n"
-        "Applied to new positions and enforced automatically.\n"
-        "_'Not Set' means never applied._\n\n"
-        "*PnL Cards*\n"
-        "Sent automatically after every sell.\n"
-        "Also available: open a position → 🎴 PnL Card.\n\n"
+        "Configure Stop Loss, Take Profit, and Trailing Stop in ⚙️ Settings.\n"
+        "Applied automatically to new positions.\n"
+        "_'Not Set' means the rule is disabled for that position._\n\n"
+        "*Challenge Rules*\n"
+        "• Profit Target: 10%\n"
+        f"• Max Drawdown: {TRADING.max_drawdown_pct:.0f}%\n"
+        f"• Max Open Positions: {TRADING.max_open_positions}\n"
+        f"• Max Position Size: {TRADING.max_allocation_pct:.0f}% of start balance\n"
+        "• Gas fee deducted per buy and sell\n\n"
         "*Supported Inputs*\n"
-        "• Solana contract address\n"
+        "• Solana contract address (any token, including migrated)\n"
         "• Ticker (e.g. BONK or $BONK)\n"
         "• pump.fun · DexScreener · Birdeye · Solscan · Meteora links\n"
         "━━━━━━━━━━━━━━━━━━━━",
@@ -1043,12 +1138,17 @@ async def _execute_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, amoun
     )
 
     if result["ok"]:
-        context.user_data["challenge"] = await db.get_active_challenge(profile["id"])
+        # Refresh challenge data so buying power is up-to-date
+        try:
+            context.user_data["challenge"] = await db.get_active_challenge(profile["id"])
+        except Exception:
+            pass
+        entry_mc = market_data["market_cap_usd"] or token.get("market_cap") or 0
         await _show(
             update, context,
             f"✅ *Buy Executed*\n\n"
             f"*{token['symbol']}*  `{_fmt_sol(amount)}`\n"
-            f"Entry: `{_fmt_price(entry_price * sol_price)}`\n"
+            f"Entry MC: `{_fmt_mc(float(entry_mc)) if entry_mc else '—'}`\n"
             f"Gas fee: `{_fmt_sol(GAS_FEE_SOL)}`\n\n"
             f"SL: `{_risk_str(sl_pct)}`  |  TP: `{_risk_str(tp_pct)}`  |  Trail: `{_risk_str(trail_pct)}`",
             InlineKeyboardMarkup([
@@ -1067,25 +1167,28 @@ async def _execute_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, amoun
 
 async def buy_q1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    p = context.user_data.get("profile")
+    p = context.user_data.get("profile") or await _linked_profile(_uid(update))
     if not p: return ConversationHandler.END
     s = await db.get_bot_settings(p["id"])
+    context.user_data["profile"] = p
     return await _execute_buy(update, context, float(s.get("quick_buy_1") or TRADING.quick_buy_1))
 
 
 async def buy_q2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    p = context.user_data.get("profile")
+    p = context.user_data.get("profile") or await _linked_profile(_uid(update))
     if not p: return ConversationHandler.END
     s = await db.get_bot_settings(p["id"])
+    context.user_data["profile"] = p
     return await _execute_buy(update, context, float(s.get("quick_buy_2") or TRADING.quick_buy_2))
 
 
 async def buy_q3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    p = context.user_data.get("profile")
+    p = context.user_data.get("profile") or await _linked_profile(_uid(update))
     if not p: return ConversationHandler.END
     s = await db.get_bot_settings(p["id"])
+    context.user_data["profile"] = p
     return await _execute_buy(update, context, float(s.get("quick_buy_3") or TRADING.quick_buy_3))
 
 
@@ -1147,10 +1250,11 @@ async def _execute_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, pct:
         price_impact_pct=market_data["price_impact_pct"],
     )
 
-    pnl   = result["pnl_sol"]
-    sign  = "+" if pnl >= 0 else ""
-    emoji = _pnl_emoji(pnl)
-    type_ = "Full Close" if pct >= 99.99 else f"Partial Sell ({pct:.0f}%)"
+    pnl      = result["pnl_sol"]
+    pnl_usd  = pnl * sol_price
+    sign     = "+" if pnl >= 0 else ""
+    emoji    = _pnl_emoji(pnl)
+    type_    = "Full Close" if pct >= 99.99 else f"Partial Sell ({pct:.0f}%)"
     net_received = result["received_sol"] - GAS_FEE_SOL
 
     await _show(
@@ -1160,7 +1264,8 @@ async def _execute_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, pct:
         f"Received: `{_fmt_sol(result['received_sol'])}`\n"
         f"Gas fee:  `{_fmt_sol(GAS_FEE_SOL)}`\n"
         f"Net:      `{_fmt_sol(net_received)}`\n"
-        f"PnL: `{sign}{_fmt_sol(pnl)}` (`{sign}{result['pnl_pct']:.2f}%`)",
+        f"PnL: `{sign}{_fmt_sol(pnl)}` (`{sign}{result['pnl_pct']:.2f}%`)  "
+        f"`{sign}{_fmt_price(pnl_usd)}`",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Positions", callback_data="positions")],
             [InlineKeyboardButton("🏠 Home",      callback_data="home")],
@@ -1193,7 +1298,11 @@ async def _execute_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, pct:
             await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
                 photo=img,
-                caption=f"🎴 *{result['token_symbol']}*  {sign}{pnl:.4f} SOL  ({sign}{result['pnl_pct']:.2f}%)",
+                caption=(
+                    f"🎴 *{result['token_symbol']}*  "
+                    f"{sign}{pnl:.4f} SOL  ({sign}{result['pnl_pct']:.2f}%)  "
+                    f"{sign}{_fmt_price(pnl_usd)}"
+                ),
                 parse_mode="Markdown",
             )
     except Exception as e:
@@ -1372,10 +1481,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
 
     elif data.startswith("pos_refresh_"):
+        # Refresh edits the current message in-place
         try:
             pos_id = int(data[12:])
             context.user_data["current_position_id"] = pos_id
-            await _show_position_screen(update, context, pos_id)
+            await _show_position_screen(update, context, pos_id, use_edit=True)
         except ValueError:
             pass
 
@@ -1413,13 +1523,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await cmd_pnl(update, context)
 
     elif data == "token_refresh":
+        # Refresh token page in-place
         token = context.user_data.get("current_token")
         p     = context.user_data.get("profile") or await _linked_profile(uid)
         ch    = context.user_data.get("challenge")
         if not ch and p:
             ch = await db.get_active_challenge(p["id"])
         if token and p and ch:
-            await _show_token_page(update, context, token["address"], p, ch)
+            await _show_token_page(update, context, token["address"], p, ch, use_edit=True)
         elif p:
             await _show_home(update, context, p)
         else:
