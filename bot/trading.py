@@ -60,6 +60,17 @@ async def _safe(coro, *, timeout: float = 5.0, default=None):
 # DexScreener helpers
 # ---------------------------------------------------------------------------
 
+def _best_solana_pair(pairs: list[dict]) -> dict | None:
+    """Pick the highest-liquidity Solana pair from a list, preferring known DEXes."""
+    solana = [p for p in pairs if p.get("chainId") == "solana"]
+    if not solana:
+        return None
+    preferred = [p for p in solana if p.get("dexId") in TRADING.supported_dex_ids]
+    pool = preferred if preferred else solana
+    pool.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+    return pool[0]
+
+
 async def search_token(query: str) -> list[dict]:
     """Search for Solana tokens. Filters to supported DEXes for ticker searches."""
     url = f"{TRADING.dexscreener_base}/search?q={query}"
@@ -84,29 +95,59 @@ async def search_token(query: str) -> list[dict]:
     return solana_pairs[:5]
 
 
-async def get_token_price(token_address: str) -> dict | None:
+async def _dex_token_v1(token_address: str) -> dict | None:
     """
-    Fetch current price data for a Solana token.
-    For direct address lookups we accept ANY Solana pair (not just supported
-    DEXes) so pump.fun-only tokens are always found.
+    DexScreener legacy API: /latest/dex/tokens/{address}
+    Returns {"pairs": [...]} — can miss tokens or return empty on flaky days.
     """
     url = f"{TRADING.dexscreener_base}/tokens/{token_address}"
     try:
-        r = await _client().get(url)
+        r = await _client().get(url, timeout=8.0)
         r.raise_for_status()
-        pairs = r.json().get("pairs") or []
+        return _best_solana_pair(r.json().get("pairs") or [])
     except Exception as e:
-        log.error("DexScreener price fetch error for %s: %s", token_address, e)
+        log.debug("DexScreener v1 failed for %s: %s", token_address, e)
         return None
 
-    solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-    if not solana_pairs:
+
+async def _dex_token_v2(token_address: str) -> dict | None:
+    """
+    DexScreener newer API: /tokens/v1/solana/{address}
+    Returns a JSON array directly — more reliable for newly listed tokens.
+    """
+    url = f"https://api.dexscreener.com/tokens/v1/solana/{token_address}"
+    try:
+        r = await _client().get(url, timeout=8.0)
+        r.raise_for_status()
+        data = r.json()
+        # Response is a list of pairs directly
+        if isinstance(data, list):
+            return _best_solana_pair(data)
+        # Some versions wrap it
+        if isinstance(data, dict):
+            return _best_solana_pair(data.get("pairs") or [])
+        return None
+    except Exception as e:
+        log.debug("DexScreener v2 failed for %s: %s", token_address, e)
         return None
 
-    preferred = [p for p in solana_pairs if p.get("dexId") in TRADING.supported_dex_ids]
-    pool = preferred if preferred else solana_pairs
-    pool.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
-    return pool[0]
+
+async def get_token_price(token_address: str) -> dict | None:
+    """
+    Fetch current price data for a Solana token.
+    Runs both DexScreener v1 and v2 in parallel — uses whichever has the
+    higher-liquidity pair so that any CA on any Solana DEX is always found.
+    """
+    v1, v2 = await asyncio.gather(
+        _safe(_dex_token_v1(token_address), timeout=9.0),
+        _safe(_dex_token_v2(token_address), timeout=9.0),
+    )
+    # Pick the pair with higher liquidity
+    candidates = [p for p in (v1, v2) if p]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+    return candidates[0]
 
 
 async def get_pair_by_pair_address(pair_address: str) -> dict | None:
@@ -133,6 +174,24 @@ async def get_pair_by_pair_address(pair_address: str) -> dict | None:
     except Exception as e:
         log.debug("DexScreener pairs lookup failed for %s: %s", pair_address, e)
     return None
+
+
+async def _jupiter_price(token_address: str) -> float | None:
+    """
+    Jupiter price API — last-resort price fallback for tokens with no DEX pair.
+    Returns USD price or None.
+    """
+    url = f"https://api.jup.ag/price/v2?ids={token_address}"
+    try:
+        r = await _client().get(url, timeout=6.0)
+        r.raise_for_status()
+        data = r.json().get("data") or {}
+        entry = data.get(token_address) or {}
+        price = entry.get("price")
+        return float(price) if price else None
+    except Exception as e:
+        log.debug("Jupiter price failed for %s: %s", token_address, e)
+        return None
 
 
 def price_in_sol(pair: dict, sol_price_usd: float) -> float:
@@ -308,83 +367,80 @@ def _estimate_price_impact_pct(liquidity_usd: float, trade_sol: float = 1.0, sol
 
 async def get_full_token_info(address: str) -> dict | None:
     """
-    Fetch complete token info. Helius is the PRIMARY source — one getAsset call
-    returns name, symbol, logo, mint authority, and price.  DexScreener enriches
-    with real-time market data (volume, liquidity, price changes).
+    Fetch complete token info for ANY Solana CA — migrated, pump.fun, or DEX-only.
 
-    For migrated tokens, the pasted address might be a liquidity pool address
-    rather than a token address (common with DexScreener URLs for migrated
-    pump.fun tokens).  In that case, we fall back to the /pairs/solana endpoint
-    to resolve the actual token address and retry.
+    Strategy (all fired in parallel):
+      1. Helius getAsset          — identity (name/symbol/logo/renounced) + price
+      2. DexScreener v1 + v2      — both endpoints fired together inside get_token_price()
+      3. pump.fun bonding curve   — for pre-migration tokens
 
-    Order of priority:
-      1. Helius getAsset  — identity (name/symbol/logo/renounced) + Helius price
-      2. DexScreener      — market data (price preferred, volume, liq, changes)
-      3. pump.fun         — bonding curve % for pre-migration tokens
+    If DexScreener returns nothing by token address, the pasted address might be a
+    pool/pair address. We try /pairs/solana/ and resolve the real token CA.
+
+    If nothing is on any DEX, Jupiter price API is used as a last-resort price source
+    so the token page still shows accurate price data.
     """
-    # All three fire in parallel; individual timeouts keep things fast.
+    # Fire everything in parallel for max speed
     helius_asset, dex_pair, curve_pct = await asyncio.gather(
-        _safe(get_helius_asset(address),       timeout=6.0),
-        _safe(get_token_price(address),        timeout=8.0),
-        _safe(get_pump_bonding_curve(address), timeout=4.0),
+        _safe(get_helius_asset(address),       timeout=7.0),
+        _safe(get_token_price(address),        timeout=10.0),   # already runs v1+v2 in parallel
+        _safe(get_pump_bonding_curve(address), timeout=5.0),
     )
 
-    # ── Migrated token fallback ──────────────────────────────────────────────
-    # If DexScreener returned nothing by token address, the pasted address might
-    # be a pair/pool address (e.g. from a DexScreener URL for a migrated token).
-    # Try the /pairs/solana endpoint to get the actual base token address.
+    # ── Pool/pair address fallback ───────────────────────────────────────────
+    # If both DexScreener endpoints returned nothing, the address might be a
+    # pool/pair address rather than a token mint (common with DexScreener URLs).
     resolved_address = address
     if not dex_pair:
-        pair_lookup = await _safe(get_pair_by_pair_address(address), timeout=6.0)
+        pair_lookup = await _safe(get_pair_by_pair_address(address), timeout=7.0)
         if pair_lookup:
-            base = pair_lookup.get("baseToken") or {}
+            base       = pair_lookup.get("baseToken") or {}
             token_addr = base.get("address")
             if token_addr and token_addr != address:
-                log.info(
-                    "Resolved pair address %s → token address %s",
-                    address, token_addr,
-                )
+                log.info("Resolved pair address %s → token %s", address, token_addr)
                 resolved_address = token_addr
-                dex_pair = pair_lookup
-                # Re-fetch Helius for the real token address if we didn't get it
+                dex_pair         = pair_lookup
+                # Re-fetch Helius and bonding curve for the real token address
                 if not helius_asset:
-                    helius_asset = await _safe(get_helius_asset(token_addr), timeout=6.0)
-                # Re-fetch bonding curve for real token address
+                    helius_asset = await _safe(get_helius_asset(token_addr), timeout=7.0)
                 if curve_pct is None:
-                    curve_pct = await _safe(get_pump_bonding_curve(token_addr), timeout=4.0)
+                    curve_pct = await _safe(get_pump_bonding_curve(token_addr), timeout=5.0)
             else:
                 dex_pair = pair_lookup
 
-    # Parse Helius result
+    # ── Parse Helius ─────────────────────────────────────────────────────────
     name = symbol = logo = None
-    renounced      = None
-    helius_price   = 0.0
+    renounced    = None
+    helius_price = 0.0
 
     if helius_asset:
-        parsed     = _parse_helius_asset(helius_asset)
-        name       = parsed["name"]
-        symbol     = parsed["symbol"]
-        logo       = parsed["logo"]
-        renounced  = parsed["renounced"]
+        parsed       = _parse_helius_asset(helius_asset)
+        name         = parsed["name"]
+        symbol       = parsed["symbol"]
+        logo         = parsed["logo"]
+        renounced    = parsed["renounced"]
         helius_price = parsed["price_usd"]
 
-    # Enrich from DexScreener (fills in any blanks and adds market data)
+    # ── Enrich from DexScreener ───────────────────────────────────────────────
     if dex_pair:
         base   = dex_pair.get("baseToken") or {}
         name   = name   or base.get("name",   "Unknown")
         symbol = symbol or base.get("symbol", "???")
         logo   = logo   or (dex_pair.get("info") or {}).get("imageUrl")
 
-    # Nothing found at all — give up
+    # ── Nothing found at all — give up ───────────────────────────────────────
     if not dex_pair and not name:
+        log.warning("Token not found on any source: %s", address)
         return None
+
+    # ── Build result ─────────────────────────────────────────────────────────
+    sol_price = await db.fetch_sol_price()
 
     if dex_pair:
         liq     = dex_pair.get("liquidity") or {}
         changes = dex_pair.get("priceChange") or {}
         vol     = dex_pair.get("volume") or {}
         liq_usd = float(liq.get("usd") or 0)
-        sol_price = await db.fetch_sol_price()
         # Prefer DEX price (real-time), fall back to Helius price
         price_usd = float(dex_pair.get("priceUsd") or 0) or helius_price
         return {
@@ -403,16 +459,18 @@ async def get_full_token_info(address: str) -> dict | None:
             "price_impact":  estimate_price_impact(liq_usd, sol_price=sol_price),
             "dex_url":       dex_pair.get("url", ""),
             "renounced":     renounced,
-            "bonding_curve": None,   # migrated — no curve shown
+            "bonding_curve": None,   # migrated/listed — no bonding curve shown
         }
     else:
-        # Helius found it but it's not on any DEX yet (pre-migration)
+        # Helius found it but no DEX pair — try Jupiter for a live price
+        jupiter_price = await _safe(_jupiter_price(resolved_address), timeout=6.0)
+        final_price   = jupiter_price or helius_price
         return {
             "address":       resolved_address,
             "symbol":        symbol or "???",
             "name":          name or "Unknown",
             "logo_url":      logo,
-            "price_usd":     helius_price,
+            "price_usd":     final_price,
             "market_cap":    0.0,
             "liquidity_usd": 0.0,
             "volume_24h":    0.0,

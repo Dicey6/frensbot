@@ -123,8 +123,14 @@ async def _edit_or_show(
     """
     Edits the current message in-place when called from a callback query
     (refresh actions), otherwise sends a new message.
-    Falls back to send_message if the edit fails for any reason.
+
+    Error handling:
+      - "Message is not modified" → silently ignore (content unchanged, no action needed).
+      - Any other edit failure → delete the old message and send a fresh one so the
+        chat stays clean (no duplicate messages pile up).
     """
+    from telegram.error import BadRequest
+
     q = update.callback_query
     if q and q.message:
         try:
@@ -135,8 +141,25 @@ async def _edit_or_show(
                 disable_web_page_preview=True,
             )
             return
+        except BadRequest as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                # Content hasn't changed — silently do nothing
+                return
+            # Any other BadRequest (e.g. message too old, media message) →
+            # delete the old message and send a clean replacement
+            log.debug("edit_message_text failed (%s), replacing message", e)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
         except Exception as e:
-            log.debug("edit_message_text failed, falling back to send: %s", e)
+            log.debug("edit_message_text failed (%s), replacing message", e)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
