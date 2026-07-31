@@ -2,14 +2,16 @@
 trading.py — Token lookup, buy/sell execution, and position monitor.
 
 Data sources:
-  - Helius API   — primary: token metadata (name, symbol, logo)
-  - DexScreener  — always: price, volume, liquidity, market cap
+  - Helius API      — primary: token metadata (name, symbol, logo) + mint authority status
+  - DexScreener     — always: price, volume, liquidity, market cap
+  - pump.fun API    — bonding curve progress % for pre-migration tokens
 
 Rules:
   - No auto-sell. Only manual sells, stop-loss, and trailing stop.
   - Trailing stop is stored on the position at creation time.
   - Every buy is validated against live Supabase challenge data.
   - Every sell records full market context for website analytics.
+  - GAS_FEE_SOL is deducted on every buy and sell.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import httpx
 
 import config
 import database as db
-from config import PLAN_USD, TRADING
+from config import GAS_FEE_SOL, PLAN_USD, TRADING
 
 log = logging.getLogger(__name__)
 
@@ -130,7 +132,7 @@ def _extract_market_data(pair: dict | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Helius metadata (primary source)
+# Helius metadata (primary source for name/symbol/logo)
 # ---------------------------------------------------------------------------
 
 async def get_token_metadata_helius(address: str) -> dict | None:
@@ -153,6 +155,100 @@ async def get_token_metadata_helius(address: str) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Helius DAS — mint authority / freeze authority check
+# ---------------------------------------------------------------------------
+
+async def get_mint_authority_status(address: str) -> dict:
+    """
+    Returns a dict:
+      renounced: bool  — True when both mintAuthority and freezeAuthority are null/revoked
+      mint_authority:   str | None
+      freeze_authority: str | None
+    Falls back gracefully if Helius is unavailable or key not set.
+    """
+    if not config.HELIUS_API_KEY:
+        return {"renounced": None, "mint_authority": None, "freeze_authority": None}
+
+    url = f"{TRADING.helius_rpc_base}/?api-key={config.HELIUS_API_KEY}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id":      "mint-auth-check",
+        "method":  "getAsset",
+        "params":  {"id": address},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(url, json=payload)
+            r.raise_for_status()
+            result = r.json().get("result") or {}
+
+        token_info = result.get("token_info") or {}
+        mint_auth   = token_info.get("mint_authority")
+        freeze_auth = token_info.get("freeze_authority")
+
+        # Also check supply.mint_authority in some DAS versions
+        supply = result.get("supply") or {}
+        if mint_auth is None:
+            mint_auth = supply.get("mint_authority")
+
+        renounced = (mint_auth is None or mint_auth == "") and (
+            freeze_auth is None or freeze_auth == ""
+        )
+        return {
+            "renounced":        renounced,
+            "mint_authority":   mint_auth,
+            "freeze_authority": freeze_auth,
+        }
+    except Exception as e:
+        log.warning("Mint authority check failed for %s: %s", address, e)
+        return {"renounced": None, "mint_authority": None, "freeze_authority": None}
+
+
+# ---------------------------------------------------------------------------
+# pump.fun bonding curve progress
+# ---------------------------------------------------------------------------
+
+async def get_pump_bonding_curve(address: str) -> float | None:
+    """
+    Returns the bonding curve completion percentage (0–100) for tokens still
+    on pump.fun's bonding curve, or None if the token has migrated to a DEX
+    or the API is unreachable.
+    """
+    url = f"{TRADING.pumpfun_api}/coins/{address}"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.get(url, headers={"Accept": "application/json"})
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+
+        # complete = True means the token has graduated off the curve
+        if data.get("complete"):
+            return None
+
+        progress = data.get("bonding_curve_progress")
+        if progress is not None:
+            return float(progress)
+
+        # Derive manually from virtual reserves if field missing
+        vr  = float(data.get("virtual_sol_reserves") or 0)
+        vt  = float(data.get("virtual_token_reserves") or 0)
+        if vr > 0 and vt > 0:
+            # heuristic: graduated once ~85 SOL in reserves
+            return min(vr / 85.0 * 100, 99.9)
+
+        return None
+    except Exception as e:
+        log.debug("pump.fun bonding curve fetch failed for %s: %s", address, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Price impact estimate
+# ---------------------------------------------------------------------------
+
 def estimate_price_impact(liquidity_usd: float, trade_sol: float = 1.0, sol_price: float = 150.0) -> str:
     if liquidity_usd <= 0:
         return "—"
@@ -166,19 +262,24 @@ def _estimate_price_impact_pct(liquidity_usd: float, trade_sol: float = 1.0, sol
 
 
 # ---------------------------------------------------------------------------
-# Full token info — Helius + DexScreener in parallel
+# Full token info — Helius + DexScreener + pump.fun + mint-auth in parallel
 # ---------------------------------------------------------------------------
 
 async def get_full_token_info(address: str) -> dict | None:
     """
-    Fetch complete token info. Helius and DexScreener fire in parallel.
-    DexScreener always provides price/liquidity/volume/market cap.
-    Helius metadata (name, symbol, logo) takes priority over DexScreener.
+    Fetch complete token info. All four sources fire in parallel.
+      - DexScreener  — price / liquidity / volume / market cap (always)
+      - Helius meta  — name, symbol, logo (priority over DexScreener)
+      - Helius DAS   — mint authority / renounced status
+      - pump.fun     — bonding curve %, only for pre-migration tokens
+
     Returns None only if DexScreener cannot find the token at all.
     """
-    dex_pair, helius_meta = await asyncio.gather(
+    dex_pair, helius_meta, mint_status, curve_pct = await asyncio.gather(
         get_token_price(address),
         get_token_metadata_helius(address),
+        get_mint_authority_status(address),
+        get_pump_bonding_curve(address),
     )
 
     name = symbol = logo = None
@@ -198,6 +299,7 @@ async def get_full_token_info(address: str) -> dict | None:
     elif not name:
         return None
 
+    # If DexScreener has a pair, the token has migrated — ignore curve_pct
     if dex_pair:
         liq     = dex_pair.get("liquidity") or {}
         changes = dex_pair.get("priceChange") or {}
@@ -205,37 +307,43 @@ async def get_full_token_info(address: str) -> dict | None:
         liq_usd = float(liq.get("usd") or 0)
         sol_price = await db.fetch_sol_price()
         return {
-            "address":       address,
-            "symbol":        symbol,
-            "name":          name,
-            "logo_url":      logo,
-            "price_usd":     float(dex_pair.get("priceUsd") or 0),
-            "market_cap":    float(dex_pair.get("marketCap") or dex_pair.get("fdv") or 0),
-            "liquidity_usd": liq_usd,
-            "volume_24h":    float(vol.get("h24") or 0),
-            "change_5m":     float(changes.get("m5") or 0),
-            "change_1h":     float(changes.get("h1") or 0),
-            "change_6h":     float(changes.get("h6") or 0),
-            "change_24h":    float(changes.get("h24") or 0),
-            "price_impact":  estimate_price_impact(liq_usd, sol_price=sol_price),
-            "dex_url":       dex_pair.get("url", ""),
+            "address":        address,
+            "symbol":         symbol,
+            "name":           name,
+            "logo_url":       logo,
+            "price_usd":      float(dex_pair.get("priceUsd") or 0),
+            "market_cap":     float(dex_pair.get("marketCap") or dex_pair.get("fdv") or 0),
+            "liquidity_usd":  liq_usd,
+            "volume_24h":     float(vol.get("h24") or 0),
+            "change_5m":      float(changes.get("m5") or 0),
+            "change_1h":      float(changes.get("h1") or 0),
+            "change_6h":      float(changes.get("h6") or 0),
+            "change_24h":     float(changes.get("h24") or 0),
+            "price_impact":   estimate_price_impact(liq_usd, sol_price=sol_price),
+            "dex_url":        dex_pair.get("url", ""),
+            # Enriched fields
+            "renounced":      mint_status.get("renounced"),
+            "bonding_curve":  None,   # migrated — no curve data shown
         }
     else:
+        # Pre-migration token (pump.fun bonding curve only)
         return {
-            "address":       address,
-            "symbol":        symbol or "???",
-            "name":          name or "Unknown",
-            "logo_url":      logo,
-            "price_usd":     0.0,
-            "market_cap":    0.0,
-            "liquidity_usd": 0.0,
-            "volume_24h":    0.0,
-            "change_5m":     0.0,
-            "change_1h":     0.0,
-            "change_6h":     0.0,
-            "change_24h":    0.0,
-            "price_impact":  "—",
-            "dex_url":       "",
+            "address":        address,
+            "symbol":         symbol or "???",
+            "name":           name or "Unknown",
+            "logo_url":       logo,
+            "price_usd":      0.0,
+            "market_cap":     0.0,
+            "liquidity_usd":  0.0,
+            "volume_24h":     0.0,
+            "change_5m":      0.0,
+            "change_1h":      0.0,
+            "change_6h":      0.0,
+            "change_24h":     0.0,
+            "price_impact":   "—",
+            "dex_url":        "",
+            "renounced":      mint_status.get("renounced"),
+            "bonding_curve":  curve_pct,
         }
 
 

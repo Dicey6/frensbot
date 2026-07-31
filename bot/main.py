@@ -32,7 +32,7 @@ from telegram.ext import (
 import config
 import database as db
 import trading
-from config import TRADING
+from config import GAS_FEE_SOL, TRADING
 from pnl import generate_pnl_card, generate_position_card
 
 logging.basicConfig(
@@ -346,6 +346,25 @@ async def _show_token_page(
     open_pos     = int(challenge.get("open_positions") or 0)
     drawdown     = float(challenge.get("drawdown") or summary["drawdown_pct"])
 
+    # ── Bonding curve line (only for pump.fun tokens still on the curve)
+    curve_pct = token.get("bonding_curve")
+    if curve_pct is not None:
+        bar_filled = int(curve_pct / 5)           # 0-20 blocks
+        bar_empty  = 20 - bar_filled
+        curve_bar  = "█" * bar_filled + "░" * bar_empty
+        curve_line = f"*Bonding Curve:* `{curve_bar}` `{curve_pct:.1f}%`\n"
+    else:
+        curve_line = ""
+
+    # ── Mint authority / renounced status line
+    renounced = token.get("renounced")
+    if renounced is True:
+        authority_line = f"*Mint Authority:* Renounced ✅\n"
+    elif renounced is False:
+        authority_line = f"*Mint Authority:* Active ⚠️\n"
+    else:
+        authority_line = ""    # Helius unavailable — omit silently
+
     text = (
         f"*{token['name']}*  `{token['symbol']}`\n"
         f"`{short}`\n"
@@ -357,6 +376,8 @@ async def _show_token_page(
         f"*Liquidity:* `{_fmt_mc(token['liquidity_usd'])}`\n"
         f"*24h Volume:* `{_fmt_mc(token['volume_24h'])}`\n"
         f"*Price Impact:* `{token['price_impact']}`\n"
+        f"{curve_line}"
+        f"{authority_line}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"*Plan:* {plan}  |  *Positions:* `{open_pos}/{TRADING.max_open_positions}`\n"
         f"*Buying Power:* `{_fmt_sol(summary['available_sol'])}`  |  "
@@ -887,7 +908,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Supported Inputs*\n"
         "• Solana contract address\n"
         "• Ticker (e.g. BONK or $BONK)\n"
-        "• pump.fun · DexScreener · Birdeye · Solscan links\n"
+        "• pump.fun · DexScreener · Birdeye · Solscan · Meteora links\n"
         "━━━━━━━━━━━━━━━━━━━━",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 fundedfrens.com", url="https://fundedfrens.com")],
@@ -956,13 +977,16 @@ async def _execute_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, amoun
         await _show(update, context, "⏱ Session expired. Paste the token again.", _home_keyboard())
         return ConversationHandler.END
 
-    summary = await db.get_account_summary(profile["id"], challenge)
-    if amount > summary["available_sol"]:
+    summary    = await db.get_account_summary(profile["id"], challenge)
+    total_cost = amount + GAS_FEE_SOL
+    if total_cost > summary["available_sol"]:
         await _show(
             update, context,
             f"❌ *Insufficient Buying Power*\n\n"
             f"Available: `{_fmt_sol(summary['available_sol'])}`\n"
-            f"Requested: `{_fmt_sol(amount)}`",
+            f"Requested: `{_fmt_sol(amount)}`\n"
+            f"Gas fee:   `{_fmt_sol(GAS_FEE_SOL)}`\n"
+            f"Total:     `{_fmt_sol(total_cost)}`",
             InlineKeyboardMarkup([[InlineKeyboardButton("← Token Page", callback_data="token_refresh")]]),
         )
         return ConversationHandler.END
@@ -1005,7 +1029,8 @@ async def _execute_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, amoun
             update, context,
             f"✅ *Buy Executed*\n\n"
             f"*{token['symbol']}*  `{_fmt_sol(amount)}`\n"
-            f"Entry: `{_fmt_price(entry_price * sol_price)}`\n\n"
+            f"Entry: `{_fmt_price(entry_price * sol_price)}`\n"
+            f"Gas fee: `{_fmt_sol(GAS_FEE_SOL)}`\n\n"
             f"SL: `{_risk_str(sl_pct)}`  |  TP: `{_risk_str(tp_pct)}`  |  Trail: `{_risk_str(trail_pct)}`",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 View Positions", callback_data="positions")],
@@ -1107,12 +1132,15 @@ async def _execute_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, pct:
     sign  = "+" if pnl >= 0 else ""
     emoji = _pnl_emoji(pnl)
     type_ = "Full Close" if pct >= 99.99 else f"Partial Sell ({pct:.0f}%)"
+    net_received = result["received_sol"] - GAS_FEE_SOL
 
     await _show(
         update, context,
         f"{emoji} *Sell Executed — {type_}*\n\n"
         f"*{result['token_symbol']}*\n"
         f"Received: `{_fmt_sol(result['received_sol'])}`\n"
+        f"Gas fee:  `{_fmt_sol(GAS_FEE_SOL)}`\n"
+        f"Net:      `{_fmt_sol(net_received)}`\n"
         f"PnL: `{sign}{_fmt_sol(pnl)}` (`{sign}{result['pnl_pct']:.2f}%`)",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Positions", callback_data="positions")],
@@ -1226,6 +1254,9 @@ def _extract_address(text: str) -> str | None:
         r"birdeye\.so/token/([1-9A-HJ-NP-Za-km-z]{32,44})",
         r"solscan\.io/token/([1-9A-HJ-NP-Za-km-z]{32,44})",
         r"geckoterminal\.com/solana/pools/([1-9A-HJ-NP-Za-km-z]{32,44})",
+        # Meteora pool URLs — extract the base-token mint (first address segment)
+        r"meteora\.ag/pools?/([1-9A-HJ-NP-Za-km-z]{32,44})",
+        r"app\.meteora\.ag/(?:dlmm|pools?)/([1-9A-HJ-NP-Za-km-z]{32,44})",
     ]:
         m = re.search(pattern, text)
         if m:

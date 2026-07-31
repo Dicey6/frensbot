@@ -39,9 +39,6 @@ HELIUS_API_KEY: str | None = os.getenv("HELIUS_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Challenge plans — fallback values only.
-# The bot stores start_balance_sol in Supabase at first access.
-# PLAN_USD is used ONLY when order data is unavailable (e.g. manually created
-# challenges with no linked order).
 # ---------------------------------------------------------------------------
 
 PLAN_USD: dict[str, float] = {
@@ -49,6 +46,13 @@ PLAN_USD: dict[str, float] = {
     "advanced":     1100.0,
     "professional": 3500.0,
 }
+
+
+# ---------------------------------------------------------------------------
+# Gas fee — fixed SOL amount deducted from every buy and sell
+# ---------------------------------------------------------------------------
+
+GAS_FEE_SOL: float = 0.0001
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +66,7 @@ class TradingConfig:
     max_allocation_pct: float = 30.0      # max % of demo balance per position
 
     # Challenge rule limits
-    max_drawdown_pct:       float = 10.0
+    max_drawdown_pct: float = 10.0
 
     # Default quick-buy amounts (user can override in Settings)
     quick_buy_1: float = 0.1
@@ -78,8 +82,6 @@ class TradingConfig:
     monitor_interval_seconds: int = 30
 
     # Supported Solana DEXes (DexScreener dexId values).
-    # Used for filtering when searching by ticker.
-    # For direct address lookup we fall back to ANY Solana pair.
     supported_dex_ids: frozenset = field(default_factory=lambda: frozenset({
         "raydium", "orca", "meteora", "pump", "moonshot",
         "fluxbeam", "lifinity", "whirlpool",
@@ -93,18 +95,20 @@ class TradingConfig:
 
     # API endpoints
     dexscreener_base: str = "https://api.dexscreener.com/latest/dex"
-    helius_base: str      = "https://api.helius.xyz/v0"
+    helius_base:      str = "https://api.helius.xyz/v0"
+    helius_rpc_base:  str = "https://mainnet.helius-rpc.com"
+    pumpfun_api:      str = "https://frontend-api.pump.fun"
 
 
 TRADING = TradingConfig()
 
 
 # ---------------------------------------------------------------------------
-# PnL card rendering
+# PnL card rendering — 1920 × 1080 (16:9)
 # ---------------------------------------------------------------------------
 
-CARD_WIDTH  = 1200
-CARD_HEIGHT = 675
+CARD_WIDTH  = 1920
+CARD_HEIGHT = 1080
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 FONTS_DIR  = os.path.join(ASSETS_DIR, "fonts")
