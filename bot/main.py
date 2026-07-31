@@ -63,7 +63,28 @@ def _home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🏆 Challenge", callback_data="challenge"),
             InlineKeyboardButton("⚙️ Settings",  callback_data="settings"),
         ],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
+        [
+            InlineKeyboardButton("🎴 PnL Card",   callback_data="cmd_pnl"),
+            InlineKeyboardButton("📋 Commands",   callback_data="commands"),
+        ],
+    ])
+
+
+def _commands_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Positions",  callback_data="positions"),
+            InlineKeyboardButton("💼 Portfolio",  callback_data="portfolio"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Challenge",  callback_data="challenge"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="settings"),
+        ],
+        [
+            InlineKeyboardButton("🎴 PnL Card",   callback_data="cmd_pnl"),
+            InlineKeyboardButton("❓ Help",        callback_data="help"),
+        ],
+        [InlineKeyboardButton("🏠 Home",           callback_data="home")],
     ])
 
 
@@ -317,8 +338,6 @@ async def _show_token_page(
     profile: dict,
     challenge: dict,
 ) -> None:
-    await _show(update, context, "🔍 Loading token...")
-
     token = await trading.get_full_token_info(address)
     if not token:
         await _show(
@@ -1300,7 +1319,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not challenge:
             await _show_no_challenge(update, context)
             return
-        await _show(update, context, f"🔍 Searching for `{ticker}`...")
         pairs = await trading.search_token(ticker)
         if pairs:
             info = trading.extract_token_info(pairs[0])
@@ -1383,6 +1401,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "help":
         await cmd_help(update, context)
+
+    elif data == "commands":
+        await _show(
+            update, context,
+            "📋 *Commands*\n\nTap any command to run it:",
+            _commands_keyboard(),
+        )
+
+    elif data == "cmd_pnl":
+        await cmd_pnl(update, context)
 
     elif data == "token_refresh":
         token = context.user_data.get("current_token")
@@ -1549,6 +1577,21 @@ def main() -> None:
     _start_health_server()
 
     app = Application.builder().token(config.BOT_TOKEN).build()
+
+    # Register slash commands so "/" shows the full list in Telegram
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().run_until_complete(
+        app.bot.set_my_commands([
+            ("start",     "Start the bot"),
+            ("home",      "Home screen"),
+            ("positions", "View open positions"),
+            ("portfolio", "Portfolio & stats"),
+            ("challenge", "Challenge account"),
+            ("pnl",       "Generate PnL card"),
+            ("settings",  "Configure quick-buy/sell & risk"),
+            ("help",      "Help & instructions"),
+        ])
+    )
 
     app.add_handler(_buy_conv())
     app.add_handler(_sell_conv())

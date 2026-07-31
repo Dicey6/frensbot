@@ -29,6 +29,32 @@ from config import GAS_FEE_SOL, PLAN_USD, TRADING
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Persistent HTTP client — reused across all requests (avoids per-call
+# connection-pool setup overhead which is the #1 latency killer)
+# ---------------------------------------------------------------------------
+
+_http_client: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=4.0),
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+            follow_redirects=True,
+        )
+    return _http_client
+
+
+async def _safe(coro, *, timeout: float = 5.0, default=None):
+    """Run coro with an individual timeout; return default on any error."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except Exception:
+        return default
+
 
 # ---------------------------------------------------------------------------
 # DexScreener helpers
@@ -38,10 +64,9 @@ async def search_token(query: str) -> list[dict]:
     """Search for Solana tokens. Filters to supported DEXes for ticker searches."""
     url = f"{TRADING.dexscreener_base}/search?q={query}"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as http:
-            r = await http.get(url)
-            r.raise_for_status()
-            pairs = r.json().get("pairs") or []
+        r = await _client().get(url)
+        r.raise_for_status()
+        pairs = r.json().get("pairs") or []
     except Exception as e:
         log.error("DexScreener search error: %s", e)
         return []
@@ -67,10 +92,9 @@ async def get_token_price(token_address: str) -> dict | None:
     """
     url = f"{TRADING.dexscreener_base}/tokens/{token_address}"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as http:
-            r = await http.get(url)
-            r.raise_for_status()
-            pairs = r.json().get("pairs") or []
+        r = await _client().get(url)
+        r.raise_for_status()
+        pairs = r.json().get("pairs") or []
     except Exception as e:
         log.error("DexScreener price fetch error for %s: %s", token_address, e)
         return None
@@ -140,16 +164,15 @@ async def get_token_metadata_helius(address: str) -> dict | None:
         return None
     url = f"{TRADING.helius_base}/token-metadata?api-key={config.HELIUS_API_KEY}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as http:
-            r = await http.post(url, json={
-                "mintAccounts":    [address],
-                "includeOffChain": True,
-                "disableCache":    False,
-            })
-            r.raise_for_status()
-            data = r.json()
-            if data and isinstance(data, list):
-                return data[0]
+        r = await _client().post(url, json={
+            "mintAccounts":    [address],
+            "includeOffChain": True,
+            "disableCache":    False,
+        })
+        r.raise_for_status()
+        data = r.json()
+        if data and isinstance(data, list):
+            return data[0]
     except Exception as e:
         log.warning("Helius metadata fetch failed for %s: %s", address, e)
     return None
@@ -178,10 +201,9 @@ async def get_mint_authority_status(address: str) -> dict:
         "params":  {"id": address},
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as http:
-            r = await http.post(url, json=payload)
-            r.raise_for_status()
-            result = r.json().get("result") or {}
+        r = await _client().post(url, json=payload)
+        r.raise_for_status()
+        result = r.json().get("result") or {}
 
         token_info = result.get("token_info") or {}
         mint_auth   = token_info.get("mint_authority")
@@ -217,12 +239,11 @@ async def get_pump_bonding_curve(address: str) -> float | None:
     """
     url = f"{TRADING.pumpfun_api}/coins/{address}"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as http:
-            r = await http.get(url, headers={"Accept": "application/json"})
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            data = r.json()
+        r = await _client().get(url, headers={"Accept": "application/json"})
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json()
 
         # complete = True means the token has graduated off the curve
         if data.get("complete"):
@@ -275,11 +296,13 @@ async def get_full_token_info(address: str) -> dict | None:
 
     Returns None only if DexScreener cannot find the token at all.
     """
+    # Fire all sources in parallel with individual timeouts so a slow
+    # enrichment call (Helius / pump.fun) never blocks the DEX result.
     dex_pair, helius_meta, mint_status, curve_pct = await asyncio.gather(
-        get_token_price(address),
-        get_token_metadata_helius(address),
-        get_mint_authority_status(address),
-        get_pump_bonding_curve(address),
+        _safe(get_token_price(address),            timeout=8.0),
+        _safe(get_token_metadata_helius(address),  timeout=5.0),
+        _safe(get_mint_authority_status(address),  timeout=5.0),
+        _safe(get_pump_bonding_curve(address),     timeout=4.0),
     )
 
     name = symbol = logo = None
