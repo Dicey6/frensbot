@@ -161,8 +161,9 @@ async def get_active_challenge(user_id: str) -> dict | None:
 
 async def _initialize_challenge_balance(challenge: dict) -> dict:
     """
-    Compute start_balance_sol ONCE and store it on the challenge row.
-    Uses the order's sol_price_usd if available, otherwise fetches live SOL price.
+    Compute start_balance_sol for this session and return an enriched challenge
+    dict.  We do NOT write back to the DB because the challenges table has no
+    start_balance_sol column — the value is derived at runtime from the plan.
     """
     db = await get_client()
     plan_name = (challenge.get("challenge_plan") or "starter").lower()
@@ -189,23 +190,11 @@ async def _initialize_challenge_balance(challenge: dict) -> dict:
         sol_price = await fetch_sol_price()
 
     start_balance_sol = round(plan_usd / sol_price, 9)
-
-    try:
-        await (
-            db.table("challenges")
-            .update({"start_balance_sol": start_balance_sol, "updated_at": _now()})
-            .eq("id", challenge["id"])
-            .execute()
-        )
-        challenge = {**challenge, "start_balance_sol": start_balance_sol}
-        log.info(
-            "Initialized start_balance_sol=%.4f SOL for challenge %s (plan=%s, $%.2f)",
-            start_balance_sol, challenge["id"], plan_name, sol_price,
-        )
-    except Exception as e:
-        log.error("Failed to store start_balance_sol: %s", e)
-
-    return challenge
+    log.info(
+        "Computed start_balance_sol=%.4f SOL for challenge %s (plan=%s @$%.2f)",
+        start_balance_sol, challenge["id"], plan_name, sol_price,
+    )
+    return {**challenge, "start_balance_sol": start_balance_sol}
 
 
 # ---------------------------------------------------------------------------
