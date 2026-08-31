@@ -1,5 +1,5 @@
 -- =============================================================================
--- FundedFrens Bot — Migration 004: Stable Challenge Balance & Quick Sell
+-- HoodFund Bot — Migration 004: Stable Challenge Balance & Quick Sell
 -- Run AFTER migrations 001 and 003.
 -- ADDITIVE ONLY — no existing columns are modified.
 -- =============================================================================

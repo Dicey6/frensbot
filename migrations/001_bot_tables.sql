@@ -1,5 +1,5 @@
 -- =============================================================================
--- FundedFrens Bot — Migration 001: Core Bot Tables
+-- HoodFund Bot — Migration 001: Core Bot Tables
 -- Run this in your Supabase SQL Editor before running the bot.
 -- =============================================================================
 

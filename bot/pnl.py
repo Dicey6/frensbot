@@ -2,9 +2,9 @@
 pnl.py — Pillow-based PnL card renderer.
 
 Card size  : 1920 × 1080 px (matches the supplied template)
-Template   : assets/pnl_template.png  (dark geometric / FUNDEDFRENS branding)
+Template   : assets/pnl_template.png  (dark geometric / HOODFUND branding)
 
-Because the template already carries the FUNDEDFRENS logo and border art,
+Because the template already carries the HOODFUND logo and border art,
 the programmatic header bar and footer are skipped when a template is loaded.
 Username and plan badge are drawn in the top safe-zone instead.
 
@@ -282,7 +282,7 @@ def _tile_grid(
 
 def _fmt_sol(v: float) -> str:
     sign = "+" if v >= 0 else ""
-    return f"{sign}{v:.4f} SOL"
+    return f"{sign}{v:.4f} RH"
 
 
 def _fmt_pct(v: float) -> str:
@@ -346,8 +346,8 @@ def generate_position_card(
 
     # Stats grid  3 × 2
     tiles = [
-        ("Invested",      f"{amount_sol_invested:.4f} SOL",       WHITE),
-        ("Current Value", f"{current_value_sol:.4f} SOL",         color),
+        ("Invested",      f"{amount_sol_invested:.4f} RH",       WHITE),
+        ("Current Value", f"{current_value_sol:.4f} RH",         color),
         ("Hold Time",     hold_time_str,                           WHITE),
         ("Entry MC",      _fmt_usd(entry_market_cap_usd or 0),    MUTED),
         ("Exit MC",       _fmt_usd(current_market_cap_usd or 0),  MUTED),
@@ -407,8 +407,8 @@ def generate_pnl_card(
 
     # Stats grid  3 × 2
     tiles = [
-        ("Start Balance",   f"{start_balance:.4f} SOL",      MUTED),
-        ("Current Balance", f"{current_balance:.4f} SOL",    color),
+        ("Start Balance",   f"{start_balance:.4f} RH",      MUTED),
+        ("Current Balance", f"{current_balance:.4f} RH",    color),
         ("Win Rate",        f"{win_rate:.1f}%",               GREEN if win_rate >= 50 else RED),
         ("Total Trades",    str(total_trades),                WHITE),
         ("Trading Days",    str(trading_days),                WHITE),

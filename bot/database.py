@@ -1,5 +1,5 @@
 """
-database.py — Supabase data-access layer for the FundedFrens bot.
+database.py — Supabase data-access layer for the HoodFund bot.
 
 Principles:
   - challenge.start_balance_sol is locked once at first access and never recalculated.

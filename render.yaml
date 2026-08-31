@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: frensbot
+    name: hoodfundbot
     runtime: python
     buildCommand: pip install -r bot/requirements.txt
     startCommand: python bot/main.py

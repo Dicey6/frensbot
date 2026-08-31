@@ -1,6 +1,6 @@
-# FundedFrens Telegram Trading Bot
+# HoodFund Telegram Trading Bot
 
-Simulated Solana trading terminal for the [FundedFrens](https://fundedfrens.com) challenge platform.
+Simulated Solana trading terminal for the [HoodFund](https://hoodfund.online) challenge platform.
 
 ## Features
 

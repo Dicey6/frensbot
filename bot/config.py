@@ -1,5 +1,5 @@
 """
-config.py — Environment configuration and constants for the FundedFrens Telegram bot.
+config.py — Environment configuration and constants for the HoodFund Telegram bot.
 All os.environ access is centralised here.
 """
 
@@ -30,7 +30,7 @@ BOT_TOKEN: str            = _require("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL: str         = _require("SUPABASE_URL")
 SUPABASE_SERVICE_KEY: str = _require("SUPABASE_SERVICE_ROLE_KEY")
 
-APP_URL: str   = os.getenv("APP_URL", "https://fundedfrens.com")
+APP_URL: str   = os.getenv("APP_URL", "https://hoodfund.online")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 # Helius is the primary token metadata source; DexScreener is the fallback

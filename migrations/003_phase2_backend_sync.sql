@@ -1,5 +1,5 @@
 -- =============================================================================
--- FundedFrens Bot — Migration 003: Backend Sync Columns
+-- HoodFund Bot — Migration 003: Backend Sync Columns
 -- Run AFTER 001_bot_tables.sql
 -- Adds columns that keep the website's challenges table in sync with bot data.
 -- =============================================================================

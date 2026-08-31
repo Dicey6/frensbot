@@ -530,8 +530,8 @@ async def execute_buy(
             "ok": False,
             "error": (
                 f"Position size exceeds the {TRADING.max_allocation_pct:.0f}% max allocation rule.\n\n"
-                f"Max allowed: `{max_alloc:.4f} SOL`\n"
-                f"Requested:   `{amount_sol:.4f} SOL`"
+                f"Max allowed: `{max_alloc:.4f} RH`\n"
+                f"Requested:   `{amount_sol:.4f} RH`"
             ),
         }
 
@@ -774,7 +774,7 @@ async def _check_position(
                 text=(
                     f"{emoji} *{label} Triggered*\n\n"
                     f"Token: `{result['token_symbol']}`\n"
-                    f"PnL: `{sign}{pnl:.4f} SOL ({sign}{result['pnl_pct']:.2f}%)`\n"
+                    f"PnL: `{sign}{pnl:.4f} RH ({sign}{result['pnl_pct']:.2f}%)`\n"
                     f"Sold: 100% of position"
                 ),
                 parse_mode="Markdown",

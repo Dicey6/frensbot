@@ -1,5 +1,5 @@
 """
-main.py — FundedFrens Telegram Trading Bot
+main.py — HoodFund Telegram Trading Bot
 
 Commands: /start /home /positions /portfolio /challenge /settings /help /pnl
 
@@ -183,7 +183,7 @@ def _fmt_pct(pct: float) -> str:
 
 
 def _fmt_sol(sol: float) -> str:
-    return f"{sol:.4f} SOL"
+    return f"{sol:.4f} RH"
 
 
 def _pnl_emoji(val: float) -> str:
@@ -277,14 +277,14 @@ async def _profile_and_challenge(telegram_id: int) -> tuple[dict | None, dict | 
 async def _show_not_linked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _show(
         update, context,
-        "🏆 *FundedFrens Trading Terminal*\n\n"
+        "🏆 *HoodFund Trading Terminal*\n\n"
         "To get started, link your account:\n\n"
-        "1. Go to *fundedfrens.com*\n"
+        "1. Go to *hoodfund.online*\n"
         "2. Profile → Settings → copy your *Telegram Link Code*\n"
         "3. Paste it here\n\n"
         "Format: `TG-XXXXXXXXXX`",
         InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 fundedfrens.com", url="https://fundedfrens.com")],
+            [InlineKeyboardButton("🌐 hoodfund.online", url="https://hoodfund.online")],
             [InlineKeyboardButton("❓ Help", callback_data="help")],
         ]),
     )
@@ -330,7 +330,7 @@ async def _show_home(update: Update, context: ContextTypes.DEFAULT_TYPE, profile
     open_pos = int(challenge.get("open_positions") or 0)
     drawdown = float(challenge.get("drawdown") or summary["drawdown_pct"])
     username = profile.get("username") or "Trader"
-    title    = "🏆 *Funded Trader*" if challenge.get("is_funded") else "🏆 *FundedFrens*"
+    title    = "🏆 *Funded Trader*" if challenge.get("is_funded") else "🏆 *HoodFund*"
 
     await _show(
         update, context,
@@ -470,11 +470,11 @@ async def _show_token_page(
         update, context, text,
         InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(f"Buy {qb1} SOL", callback_data="buy_q1"),
-                InlineKeyboardButton(f"Buy {qb2} SOL", callback_data="buy_q2"),
-                InlineKeyboardButton(f"Buy {qb3} SOL", callback_data="buy_q3"),
+                InlineKeyboardButton(f"Buy {qb1} RH", callback_data="buy_q1"),
+                InlineKeyboardButton(f"Buy {qb2} RH", callback_data="buy_q2"),
+                InlineKeyboardButton(f"Buy {qb3} RH", callback_data="buy_q3"),
             ],
-            [InlineKeyboardButton("Buy X SOL",  callback_data="buy_custom")],
+            [InlineKeyboardButton("Buy X RH",  callback_data="buy_custom")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="token_refresh")],
             [
                 InlineKeyboardButton("🔍 Explorer", url=explorer_url),
@@ -746,7 +746,7 @@ async def _send_position_pnl_card(update: Update, context: ContextTypes.DEFAULT_
         photo=img,
         caption=(
             f"🎴 *{position['token_symbol']}*  "
-            f"{sign}{pnl_sol:.4f} SOL  ({sign}{pnl_pct:.2f}%)  "
+            f"{sign}{pnl_sol:.4f} RH  ({sign}{pnl_pct:.2f}%)  "
             f"{sign}{_fmt_price(pnl_usd)}"
         ),
         parse_mode="Markdown",
@@ -892,9 +892,9 @@ async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------------------------
 
 _SETTINGS_MAP: dict[str, tuple[str, str]] = {
-    "setf_qb1":   ("quick_buy_1",               "Quick Buy 1 — SOL amount (e.g. `0.1`)"),
-    "setf_qb2":   ("quick_buy_2",               "Quick Buy 2 — SOL amount (e.g. `0.5`)"),
-    "setf_qb3":   ("quick_buy_3",               "Quick Buy 3 — SOL amount (e.g. `1.0`)"),
+    "setf_qb1":   ("quick_buy_1",               "Quick Buy 1 — RH amount (e.g. `0.1`)"),
+    "setf_qb2":   ("quick_buy_2",               "Quick Buy 2 — RH amount (e.g. `0.5`)"),
+    "setf_qb3":   ("quick_buy_3",               "Quick Buy 3 — RH amount (e.g. `1.0`)"),
     "setf_qs1":   ("quick_sell_1",              "Quick Sell 1 — percentage 1–100 (e.g. `25`)"),
     "setf_qs2":   ("quick_sell_2",              "Quick Sell 2 — percentage 1–100 (e.g. `50`)"),
     "setf_qs3":   ("quick_sell_3",              "Quick Sell 3 — percentage 1–100 (e.g. `100`)"),
@@ -930,7 +930,7 @@ async def _show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         update, context,
         f"⚙️ *Settings*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Quick Buy*  `{qb1}` · `{qb2}` · `{qb3}` SOL\n"
+        f"*Quick Buy*  `{qb1}` · `{qb2}` · `{qb3}` RH\n"
         f"*Quick Sell* `{qs1:.0f}%` · `{qs2:.0f}%` · `{qs3:.0f}%`\n\n"
         f"*Stop Loss:* `{sl}`  ·  *Take Profit:* `{tp}`\n"
         f"*Trailing Stop:* `{tr}`\n"
@@ -1008,7 +1008,7 @@ async def settings_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _show(
         update, context,
-        "❓ *Help — FundedFrens*\n"
+        "❓ *Help — HoodFund*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*Trading*\n"
         "Paste any CA, ticker, or link → token loads instantly.\n"
@@ -1020,17 +1020,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📊 Positions → tap a position → tap a sell button.\n"
         "Quick-sell percentages are configurable in ⚙️ Settings.\n"
         "After every sell a PnL card is sent automatically showing\n"
-        "your profit/loss in SOL and USD.\n\n"
+        "your profit/loss in RH and USD.\n\n"
         "*Position View*\n"
         "Entry and current price are shown as *Market Cap* so you can\n"
         "see exactly where the token was and is now.\n"
-        "PnL is shown in both SOL and USD.\n"
+        "PnL is shown in both RH and USD.\n"
         "The full contract address is always visible and ready to copy.\n"
         "Once a position is 100% sold, sell buttons are removed.\n"
         "Tap 🔄 Refresh to update prices in-place.\n\n"
         "*Balance*\n"
         "Your start balance is locked at challenge activation and stays\n"
-        "fixed — it does not change with SOL price movements.\n"
+        "fixed — it does not change with RH price movements.\n"
         "Buying power = start balance + realized PnL − open positions.\n\n"
         "*Risk Management*\n"
         "Configure Stop Loss, Take Profit, and Trailing Stop in ⚙️ Settings.\n"
@@ -1048,7 +1048,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• pump.fun · DexScreener · Birdeye · Solscan · Meteora links\n"
         "━━━━━━━━━━━━━━━━━━━━",
         InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 fundedfrens.com", url="https://fundedfrens.com")],
+            [InlineKeyboardButton("🌐 hoodfund.online", url="https://hoodfund.online")],
             _back(),
         ]),
     )
@@ -1221,7 +1221,7 @@ async def buy_custom_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not token: return ConversationHandler.END
     await _show(
         update, context,
-        f"💰 *Buy {token['symbol']}*\n\nEnter the amount in SOL:",
+        f"💰 *Buy {token['symbol']}*\n\nEnter the amount in RH:",
         InlineKeyboardMarkup([[InlineKeyboardButton("✕ Cancel", callback_data="token_refresh")]]),
     )
     return BUY_CUSTOM_AMOUNT
@@ -1323,7 +1323,7 @@ async def _execute_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, pct:
                 photo=img,
                 caption=(
                     f"🎴 *{result['token_symbol']}*  "
-                    f"{sign}{pnl:.4f} SOL  ({sign}{result['pnl_pct']:.2f}%)  "
+                    f"{sign}{pnl:.4f} RH  ({sign}{result['pnl_pct']:.2f}%)  "
                     f"{sign}{_fmt_price(pnl_usd)}"
                 ),
                 parse_mode="Markdown",
@@ -1707,7 +1707,7 @@ def _start_health_server() -> None:
 
 
 def main() -> None:
-    log.info("Starting FundedFrens Trading Bot...")
+    log.info("Starting HoodFund Trading Bot...")
     _start_health_server()
 
     app = Application.builder().token(config.BOT_TOKEN).build()
