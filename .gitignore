@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+
+# Assets (downloaded at runtime)
+bot/assets/fonts/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
